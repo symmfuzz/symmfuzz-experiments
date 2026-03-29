@@ -1,0 +1,17 @@
+source:
+  bin-path: "/home/user/target/ft/generator/dcmtk/build/bin/dcmqrti"
+  env:
+    - DCMDICTPATH: /home/user/profuzzbench/subjects/DICOM/dcmtk/dicom.dic
+  arguments: 
+    - "--config"
+    - "/home/user/profuzzbench/subjects/DICOM/dcmtk/dcmqrti.cfg"
+    - "--aetitle"
+    - "YOU_AET"
+    - "--remote"
+    - "ANY-SCP"
+    - "localhost"
+  input-type: Stdin
+  output-type: Tcp
+  is-server: false
+  log-stdout: true
+  log-stderr: true

@@ -1,0 +1,128 @@
+work-directory: "WORK-DIRECTORY"
+input-directory: "/home/user/pingu/no-inputs"
+timeout: 10s
+target-port: 4433
+jail-uid: UID
+jail-gid: GID
+seed: 0
+target: lsquic
+svf-so-path: "/home/user/pingu/target/release/libsvf_sys.so"
+
+monitor:
+  url: "http://127.0.0.1:8086"
+  org: "None"
+  bucket: "pingu"
+  token: ""
+  http-proxy: "http://127.0.0.1:8080"
+
+source:
+  bin-path: "/home/user/target/pingu/generator/lsquic/build/bin/http_client"
+  root-path: "/home/user/target/pingu/generator/lsquic"
+  env:
+    - LD_LIBRARY_PATH: "/home/user/pingu/target/release"
+    - FAKE_RANDOM: "1"
+    - FAKE_TIME: "2026-02-01 12:00:00"
+    - ASAN_OPTIONS: "detect_leaks=0:disable_coredump=0:abort_on_error=1:print_stacktrace=1:symbolize=1:log_path=WORK-DIRECTORY/0/source/tmp/asan_report"
+  arguments: ["-Q", "hq-29", "-H", "localhost", "-s", "127.0.0.1:4433", "-p", "/", "-r", "1", "-R", "1", "-K"]
+  cwd: "/home/user/target/pingu/generator/lsquic"
+  compdb-path: "/home/user/target/pingu/generator/lsquic/build/compile_commands.json"
+  pp-json-path: "/home/user/target/pingu/generator/lsquic/build/bin/http_client.bc.pingu.pp.json"
+  ppmeta-path: "/home/user/target/pingu/generator/lsquic/build/bin/http_client.bc.pingu.ppmeta.ll"
+  extapi-path: "/home/user/pingu/pingu-agent/pass/build/extapi.bc"
+  svfg-path: "/home/user/target/pingu/generator/lsquic/build/bin/svfg.dot"
+  icfg-path: "/home/user/target/pingu/generator/lsquic/build/bin/icfg.dot"
+  cg-path: "/home/user/target/pingu/generator/lsquic/build/bin/cg.dot"
+  func-block-table-path: "/home/user/target/pingu/generator/lsquic/build/bin/function_block_table.json"
+  func-table-path: "/home/user/target/pingu/generator/lsquic/build/bin/function_table.json"
+  loop-info-path: "/home/user/target/pingu/generator/lsquic/build/bin/loops.pingu.json"
+  log-stdout: true
+  log-stderr: true
+  log-level: info
+
+sink:
+  bin-path: "/home/user/target/pingu/consumer/lsquic/build/bin/http_server"
+  root-path: "/home/user/target/pingu/consumer/lsquic"
+  env:
+    - LD_LIBRARY_PATH: "/home/user/pingu/target/release"
+    - FAKE_RANDOM: "1"
+    - FAKE_TIME: "2026-02-01 12:00:00"
+    - ASAN_OPTIONS: "disable_coredump=0:abort_on_error=1:symbolize=1:detect_leaks=0:handle_abort=0:handle_segv=2:handle_sigbus=2:handle_sigill=2:detect_stack_use_after_return=0:detect_odr_violation=0:log_path=WORK-DIRECTORY/0/sink/tmp/asan_report"
+  arguments: ["-Q", "hq-29", "-s", "127.0.0.1:4433", "-c", "localhost,/home/user/profuzzbench/cert/fullchain.crt,/home/user/profuzzbench/cert/server.key"]
+  cwd: "/home/user/target/pingu/consumer/lsquic"
+  compdb-path: "/home/user/target/pingu/consumer/lsquic/build/compile_commands.json"
+  pp-json-path: "/home/user/target/pingu/consumer/lsquic/build/bin/http_server.bc.pingu.pp.json"
+  ppmeta-path: "/home/user/target/pingu/consumer/lsquic/build/bin/http_server.bc.pingu.ppmeta.ll"
+  extapi-path: "/home/user/pingu/pingu-agent/pass/build/extapi.bc"
+  svfg-path: "/home/user/target/pingu/consumer/lsquic/build/bin/svfg.dot"
+  icfg-path: "/home/user/target/pingu/consumer/lsquic/build/bin/icfg.dot"
+  cg-path: "/home/user/target/pingu/consumer/lsquic/build/bin/cg.dot"
+  loop-info-path: "/home/user/target/pingu/consumer/lsquic/build/bin/loops.pingu.json"
+  func-block-table-path: "/home/user/target/pingu/consumer/lsquic/build/bin/function_block_table.json"
+  func-table-path: "/home/user/target/pingu/consumer/lsquic/build/bin/function_table.json"
+  log-stdout: true
+  log-stderr: true
+  log-level: info
+  allow-unstable-sink: true
+
+stages:
+  deterministic:
+    enable: true
+    timeout-streak-threshold: 3
+    source-signaled-streak-threshold: 3
+    max-consecutive-not-interesting-per-pp: 64
+  target-state:
+    pp-reachability-routing:
+      threshold: 0.1
+      enable: false
+      lambda: 0.1
+    probabilistic:
+      llm: 0.4
+    sink-cmplog:
+      enable: true
+    source-block:
+      enable: true
+
+gcov:
+  reporter: "gcovr"
+  timeout: 5s
+  bin-path: "/home/user/target/gcov/lsquic/build/bin/http_server"
+  env:
+    - LD_PRELOAD: "/home/user/libfake_random.so:/home/user/libgcov_preload.so"
+    - FAKE_RANDOM: "1"
+    - FAKE_TIME: "2026-02-01 12:00:00"
+  src-dir: "/home/user/target/gcov/lsquic"
+
+svf:
+  llvm-path: "/usr"
+  svf-path: "/home/user/SVF"
+  z3-path: "/home/user/SVF/z3.obj"
+  build-mode: "Release"
+
+solver:
+  clangd-path: "/usr/bin/clangd"
+  extract-snippet-path: "/home/user/pingu/pingu-solver/tools/build/extract-snippet"
+  sut: "lsquic"
+  protocol: "quic"
+  max-solution-candidates: 3
+  solver-cwd: "/home/user/pingu/pingu-solver"
+  py-path: "/home/user/pingu/.venv/bin/python3"
+  solver-py-path: "/home/user/pingu/pingu-solver/src/solver.py"
+  llm:
+    max-rounds: 10
+    parallel-sessions: 2
+    timeout: 300s
+    openai-model: "x-ai/grok-4.1-fast"
+    openai-api-base-url: "https://openrouter.ai/api/v1"
+    openai-use-responses-api: false
+    http-proxy: "http://172.17.0.1:9870"
+    seed: 123
+    env:
+      - LANGSMITH_TRACING: true
+      - LANGSMITH_ENDPOINT: https://api.smith.langchain.com
+      - LANGSMITH_PROJECT: pingu-solver
+
+scheduler:
+  katz-centrality:
+    enable: true
+    alpha: 0.001
+    max-iter: 1000

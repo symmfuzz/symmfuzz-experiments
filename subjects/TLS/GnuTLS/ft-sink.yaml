@@ -1,0 +1,37 @@
+sink:
+  bin-path: "/home/user/target/ft/consumer/gnutls/src/gnutls-serv"
+  env:
+    - LD_PRELOAD: "libfake_random.so"
+    - FAKE_RANDOM: "1"
+    - LD_LIBRARY_PATH: "/home/user/local/nettle/lib64:/home/user/local/nettle/lib"
+  arguments:
+    [
+      "-a",
+      "--earlydata",
+      "--alpn=http/2",
+      "--ocsp-response=/home/user/profuzzbench/cert/ocsp.der",
+      "--x509cafile=/home/user/profuzzbench/cert/ca.crt",
+      "--x509keyfile=/home/user/profuzzbench/cert/server.key",
+      "--x509certfile=/home/user/profuzzbench/cert/server.crt",
+      "-p",
+      "4433",
+      "-b",
+    ]
+  working-dir: "/home/user/target/ft/consumer/gnutls"
+  input-type: Tcp
+  output-type: Tcp
+  is-server: true
+  server-port: "4433"
+  log-stdout: true
+  log-stderr: true
+  allow-unstable-sink: false
+
+gcov:
+  bin-path: "/home/user/target/gcov/consumer/gnutls/src/gnutls-serv"
+  cwd: "/home/user/target/gcov/consumer/gnutls/"
+  env:
+    - LD_PRELOAD: "libfake_random.so"
+    - FAKE_RANDOM: "1"
+    - LD_LIBRARY_PATH: "/home/user/local/nettle/lib64:/home/user/local/nettle/lib"
+  src-dir: "/home/user/target/gcov/consumer/gnutls"
+  reporter: gcovr

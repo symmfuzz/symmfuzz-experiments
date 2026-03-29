@@ -1,0 +1,50 @@
+diff --git a/lib/random.c b/lib/random.c
+index d6a8a91bd..7f494e91b 100644
+--- a/lib/random.c
++++ b/lib/random.c
+@@ -221,6 +221,11 @@ int gnutls_rnd(gnutls_rnd_level_t level, void *data, size_t len)
+ 	int ret;
+ 	FAIL_IF_LIB_ERROR;
+ 
++#ifdef FT_FUZZING
++	memset(data, 0xcc, len);
++	return 0;
++#endif
++
+ 	ret = _gnutls_rnd_init();
+ 	if (unlikely(ret < 0))
+ 		return gnutls_assert_val(ret);
+@@ -245,6 +250,9 @@ int gnutls_rnd(gnutls_rnd_level_t level, void *data, size_t len)
+  **/
+ void gnutls_rnd_refresh(void)
+ {
++#ifdef FT_FUZZING
++	return;
++#endif
+ 	if (rnd_initialized && _gnutls_rnd_ops.rnd_refresh)
+ 		_gnutls_rnd_ops.rnd_refresh(gl_tls_get(ctx_key));
+ }
+diff --git a/src/serv.c b/src/serv.c
+index 86008c952..28635900f 100644
+--- a/src/serv.c
++++ b/src/serv.c
+@@ -53,6 +53,10 @@
+ #include "xalloc.h"
+ #include "xsize.h"
+ 
++#ifdef FT_FUZZING
++#undef HAVE_IPV6
++#endif
++
+ /* konqueror cannot handle sending the page in multiple
+  * pieces.
+  */
+@@ -1138,7 +1142,7 @@ static void terminate(int sig)
+ 	*p++ = '\n';
+ 
+ 	write(STDERR_FILENO, buf, p - buf);
+-	_exit(1);
++	exit(1);
+ }
+ 
+ static void check_alert(gnutls_session_t session, int ret)

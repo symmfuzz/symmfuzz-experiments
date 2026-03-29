@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.4
+
+ARG BASE_IMAGE=pingu-env:latest
+
+FROM ${BASE_IMAGE}
+
+USER user
+ENV HOME=/home/user
+
+ARG MAKE_OPT="-j4"
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG http_proxy=${HTTP_PROXY}
+ARG https_proxy=${HTTPS_PROXY}
+ENV no_proxy="localhost,127.0.0.1,192.168.0.0/16,172.16.0.0/12,10.0.0.0/8"
+ENV NO_PROXY=${no_proxy}
+ENV HTTP_PROXY=${HTTP_PROXY}
+ENV HTTPS_PROXY=${HTTPS_PROXY}
+ENV http_proxy=${HTTP_PROXY}
+ENV https_proxy=${HTTPS_PROXY}
+
+ARG UID
+ARG GID
+
+ARG FUZZER
+ARG TARGET
+ARG VERSION
+ARG GENERATOR
+ARG CARGO_BUILD_JOBS="4"
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+ENV FUZZER=${FUZZER}
+ENV TARGET=${TARGET}
+ENV VERSION=${VERSION}
+ENV GENERATOR=${GENERATOR}
+ENV TERM=xterm
+
+RUN --mount=type=bind,source=.,target=/home/user/profuzzbench \
+    /bin/bash -c "set -euxo pipefail && bash ${HOME}/profuzzbench/scripts/dispatch.sh ${TARGET} build deps"
+RUN --mount=type=bind,source=.,target=/home/user/profuzzbench \
+    --mount=type=cache,target=/home/user/.git-cache,uid=${UID},gid=${GID} \
+    /bin/bash -c "set -euxo pipefail && bash ${HOME}/profuzzbench/scripts/dispatch.sh ${TARGET} checkout ${VERSION}"
+RUN --mount=type=bind,source=.,target=/home/user/profuzzbench \
+    /bin/bash -c "set -euxo pipefail && bash ${HOME}/profuzzbench/scripts/dispatch.sh ${TARGET} build asan ${VERSION}"
+RUN --mount=type=bind,source=.,target=/home/user/profuzzbench \
+    /bin/bash -c "set -euxo pipefail && bash ${HOME}/profuzzbench/scripts/dispatch.sh ${TARGET} build gcov"
+RUN --mount=type=bind,source=.,target=/home/user/profuzzbench \
+    /bin/bash -c "set -euxo pipefail && bash ${HOME}/profuzzbench/scripts/dispatch.sh ${TARGET} build ${FUZZER}"
