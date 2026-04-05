@@ -1,0 +1,42 @@
+work-directory: "WORK-DIRECTORY"
+input-directory: "/home/user/profuzzbench/no-inputs"
+jail-uid: UID
+jail-gid: GID
+timeout: TIMEOUT
+target-port: 7899
+target: mosquitto
+
+source:
+  bin-path: "/home/user/target/pingu/generator/mosquitto/build/src/mosquitto"
+  root-path: "/home/user/target/pingu/generator/mosquitto"
+  arguments: ["-p", "7899"]
+  env:
+    - LD_PRELOAD: "libfake_random.so"
+    - FAKE_RANDOM: "1"
+  cwd: "/home/user/target/pingu/generator/mosquitto"
+  input-type: stdin
+  output-type: socket
+  log-stdout: true
+  log-stderr: true
+
+sink:
+  bin-path: "/home/user/target/pingu/consumer/mosquitto/build/src/mosquitto"
+  root-path: "/home/user/target/pingu/consumer/mosquitto"
+  arguments: ["-p", "7899"]
+  env:
+    - LD_PRELOAD: "libfake_random.so"
+    - FAKE_RANDOM: "1"
+    - ASAN_OPTIONS: "detect_leaks=0:disable_coredump=0:abort_on_error=1:print_stacktrace=1:symbolize=1"
+  cwd: "/home/user/target/pingu/consumer/mosquitto"
+  input-type: socket
+  output-type: stdout
+  log-stdout: true
+  log-stderr: true
+  allow-unstable-sink: true
+
+gcov:
+  bin-path: "/home/user/target/gcov/consumer/mosquitto/build/src/mosquitto"
+  env:
+    - LD_PRELOAD: "libfake_random.so:libgcov_preload.so"
+    - FAKE_RANDOM: "1"
+  src-dir: "/home/user/target/gcov/consumer/mosquitto"

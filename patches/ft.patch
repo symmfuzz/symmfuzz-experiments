@@ -1,0 +1,1905 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 68ba1a2..03b76aa 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -29,7 +29,7 @@ lazy_static = "1.4.0"
+ #ipc-channel = "0.16.0"
+ serde = { version="1.0.163", features = ["derive"] }
+ repr-trait = "1.0.0"
+-log = { version = "0.4.17", features = ["release_max_level_debug", "kv_unstable", "serde"] }
++log = { version = "0.4.17", features = ["kv_unstable", "serde"] }
+ parking_lot = "0.12.1"
+ byte-unit = "4.0.19"
+ llvm_stackmap = "0.1.5"
+diff --git a/fuzztruction_shared/src/constants.rs b/fuzztruction_shared/src/constants.rs
+index 92f1bce..be052dc 100644
+--- a/fuzztruction_shared/src/constants.rs
++++ b/fuzztruction_shared/src/constants.rs
+@@ -1,4 +1,4 @@
+-pub const MAX_MUTATION_CACHE_ENTRIES: usize = 200000;
++pub const MAX_MUTATION_CACHE_ENTRIES: usize = 2000000;
+ pub const PATCH_POINT_SIZE: usize = 32;
+ pub const ENV_SHM_NAME: &str = "FT_SHM_NAME";
+ pub const ENV_LOG_LEVEL: &str = "FT_LOG_LEVEL";
+diff --git a/fuzztruction_shared/src/mutation_cache_content.rs b/fuzztruction_shared/src/mutation_cache_content.rs
+index 2b40d69..5868cdb 100644
+--- a/fuzztruction_shared/src/mutation_cache_content.rs
++++ b/fuzztruction_shared/src/mutation_cache_content.rs
+@@ -1,7 +1,5 @@
+ use std::{cmp::min, mem, ptr};
+ 
+-use log::warn;
+-
+ use crate::{
+     constants::MAX_MUTATION_CACHE_ENTRIES, mutation_cache_entry::MutationCacheEntry,
+     types::MutationSiteID,
+@@ -139,6 +137,7 @@ impl MutationCacheContent {
+         assert!(self.next_free_slot < self.entry_decriptor_tbl.len());
+ 
+         if entry.size() > self.space_left() {
++            log::error!("Not enough space left in the cache to push entry");
+             return None;
+         }
+ 
+@@ -151,6 +150,7 @@ impl MutationCacheContent {
+             *slot = descriptor;
+             self.next_free_slot = min(self.next_free_slot + 1, max_slot_idx);
+         } else {
++            log::error!("entry_decriptor_tbl[{}] is not None", self.next_free_slot);
+             return None;
+         }
+ 
+@@ -168,7 +168,7 @@ impl MutationCacheContent {
+                 return Some(&*(dst_addr as *const MutationCacheEntry));
+             };
+         } else {
+-            warn!("Not enough descriptor entries available");
++            log::error!("Not enough descriptor entries available");
+             return None;
+         }
+     }
+diff --git a/fuzztruction_shared/src/util.rs b/fuzztruction_shared/src/util.rs
+index 0d07540..14903c0 100644
+--- a/fuzztruction_shared/src/util.rs
++++ b/fuzztruction_shared/src/util.rs
+@@ -1,8 +1,9 @@
+-use anyhow::{anyhow, Result};
++use anyhow::Result;
+ use log::log_enabled;
+ use nix::{
+     sys::signal::Signal,
+-    unistd::{close, Pid},
++    sys::wait::{waitpid, WaitPidFlag, WaitStatus},
++    unistd::Pid,
+ };
+ use std::{
+     alloc,
+@@ -12,9 +13,8 @@ use std::{
+         Arc,
+     },
+     thread,
+-    time::Duration,
++    time::{Duration, Instant},
+ };
+-use syscalls::{syscall2, Sysno};
+ 
+ pub trait ExpectNone {
+     /// Whether this value is None.
+@@ -91,26 +91,26 @@ pub fn current_log_level() -> log::Level {
+ pub fn wait_pid_timeout(
+     pid: i32,
+     timeout: Option<Duration>,
+-) -> Result<Option<nix::sys::wait::WaitStatus>> {
+-    let fd: i32 = match unsafe { syscall2(Sysno::pidfd_open, pid.try_into().unwrap(), 0) } {
+-        Ok(fd) => fd.try_into().unwrap(),
+-        err @ Err(_) => return Err(anyhow!("Error while calling pidfd_open: {:?}", err)),
+-    };
+-
+-    let _fd_guard = scopeguard::guard(fd, |v| close(v).unwrap());
+-
+-    let mut pollable_fds = vec![filedescriptor::pollfd {
+-        fd: fd.try_into().unwrap(),
+-        events: filedescriptor::POLLIN,
+-        revents: 0,
+-    }];
+-
+-    match filedescriptor::poll(&mut pollable_fds, timeout) {
+-        Ok(_) => {
+-            let wait_status = nix::sys::wait::waitpid(Pid::from_raw(pid), None)?;
+-            Ok(Some(wait_status))
++) -> Result<Option<WaitStatus>, anyhow::Error> {
++    let pid = Pid::from_raw(pid);
++    let start_time = Instant::now();
++
++    loop {
++        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
++            Ok(WaitStatus::StillAlive) => {
++                // 进程仍在运行，检查是否超时
++                if let Some(timeout) = timeout {
++                    if start_time.elapsed() >= timeout {
++                        return Err(anyhow::anyhow!("Timeout while waiting for pid: {}", pid));
++                    }
++                }
++                // 短暂睡眠以减少 CPU 使用
++                std::thread::sleep(Duration::from_millis(10));
++            }
++            Ok(status) => return Ok(Some(status)), // 进程已结束
++            Err(nix::Error::ECHILD) => return Ok(None), // 没有子进程
++            Err(e) => return Err(anyhow::anyhow!("Error while waiting for pid: {}", e)),
+         }
+-        Err(_) => Ok(None),
+     }
+ }
+ 
+diff --git a/generator/agent/src/agent.rs b/generator/agent/src/agent.rs
+index 4ef436a..264c94f 100644
+--- a/generator/agent/src/agent.rs
++++ b/generator/agent/src/agent.rs
+@@ -1,4 +1,3 @@
+-
+ use fuzztruction_shared::messages;
+ use fuzztruction_shared::{
+     communication_channel::{CommunicationChannel, CommunicationChannelError},
+@@ -373,6 +372,10 @@ fn run(agent: &mut Agent, _msg: &RunMessage) -> ProcessType {
+             // Prevent the child from messing with the mutation cache. However, keep it mapped,
+             // for accessing the mutation masks and updating runtime vars.
+             agent.mutation_cache.make_private().unwrap();
++
++            std::env::set_var("FAKETIME", "@2024-08-01 00:00:00");
++            std::env::set_var("FAKE_RANDOM", "1");
++
+             return ProcessType::CHILD;
+         }
+ 
+diff --git a/generator/pass/fuzztruction-source-clang-fast.c b/generator/pass/fuzztruction-source-clang-fast.c
+index 47294d0..45bd76d 100644
+--- a/generator/pass/fuzztruction-source-clang-fast.c
++++ b/generator/pass/fuzztruction-source-clang-fast.c
+@@ -36,12 +36,20 @@ typedef struct {
+ 
+ const char* PASS_SO_NAME = "fuzztruction-source-llvm-pass.so";
+ char *pass_path;
++char generator_agent_linkage[1024];
+ 
+ void find_pass()
+ {
+     char *guess;
+     char *cwd;
+ 
++    char *pass_path_env = getenv("LLVM_PASS_SO");
++    if (pass_path_env != NULL && !access(pass_path_env, R_OK))
++    {
++        pass_path = pass_path_env;
++        goto done;
++    }
++
+     cwd = getcwd(NULL, 0);
+     if (!cwd) {
+         PFATAL("Failed to get CWD");
+@@ -163,7 +171,16 @@ args_t* rewrite_argv(const char *argv[], int argc, arg_settings_t* arg_settings)
+     }
+ 
+     // Link against our agent that is called by a call our pass injected into main().
+-    self->argv[self->argc++] = "-L/home/user/fuzztruction/target/debug";
++    char *generator_agent_dir = getenv("GENERATOR_AGENT_SO_DIR");
++    if (generator_agent_dir != NULL)
++    {
++        sprintf(generator_agent_linkage, "-L%s", generator_agent_dir);
++        self->argv[self->argc++] = generator_agent_linkage;
++    }
++    else
++    {
++        self->argv[self->argc++] = "-L/home/user/fuzztruction/target/debug";
++    }
+     self->argv[self->argc++] = "-lgenerator_agent";
+     self->argv[self->argc++] = "-DNDEBUG";
+ 
+diff --git a/generator/pass/fuzztruction-source-llvm-pass.cc b/generator/pass/fuzztruction-source-llvm-pass.cc
+index f275c54..2bdfdc8 100644
+--- a/generator/pass/fuzztruction-source-llvm-pass.cc
++++ b/generator/pass/fuzztruction-source-llvm-pass.cc
+@@ -233,20 +233,55 @@ bool FuzztructionSourcePass::initializeFuzzingStub(Module &M) {
+         ins_builder.CreateCall(init_hook_fn);
+     }
+ 
++    auto collect_callsites = [](Function *fn) {
++        SmallVector<CallBase *, 16> callsites;
++        for (auto *user : fn->users()) {
++            if (auto *call_base = dyn_cast<CallBase>(user)) {
++                callsites.push_back(call_base);
++                continue;
++            }
++
++            // The callee may be wrapped in a bitcast constant expression.
++            if (auto *const_expr = dyn_cast<ConstantExpr>(user)) {
++                for (auto *ce_user : const_expr->users()) {
++                    if (auto *call_base = dyn_cast<CallBase>(ce_user)) {
++                        callsites.push_back(call_base);
++                    }
++                }
++            }
++        }
++        return callsites;
++    };
++
++    auto insert_hook_after_callsite = [&](CallBase *call_base, FunctionCallee hook_fn, StringRef target_name) {
++        if (auto *call_ins = dyn_cast<CallInst>(call_base)) {
++            dbgs() << "patching " << target_name << " call: " << *call_ins << "\n";
++            IRBuilder<> ins_builder(call_ins->getNextNode());
++            ins_builder.CreateCall(hook_fn);
++            return;
++        }
++
++        if (auto *invoke_ins = dyn_cast<InvokeInst>(call_base)) {
++            dbgs() << "patching " << target_name << " invoke: " << *invoke_ins << "\n";
++
++            // Hook needs to run only after a successful return from invoke.
++            BasicBlock *hook_bb = SplitEdge(invoke_ins->getParent(), invoke_ins->getNormalDest());
++            IRBuilder<> ins_builder(&*hook_bb->getFirstInsertionPt());
++            ins_builder.CreateCall(hook_fn);
++        }
++    };
++
+     // Insert a call to __ft_after_listen after the 'listen' function returns.
+     auto listen_hook_fn = M.getOrInsertFunction("__ft_after_listen", FunctionType::getVoidTy(M.getContext()));
+     auto listen_fn = M.getFunction("listen");
+     if (listen_fn && listen_fn->arg_size() == 2) {
+-        // check if arg types match those of the type of listen function we are interested in.
+-        auto first_arg = listen_fn->getArg(0);
+-        auto second_arg = listen_fn->getArg(1);
++        // Check if arg types match those of the listen function we are interested in.
++        auto *first_arg = listen_fn->getArg(0);
++        auto *second_arg = listen_fn->getArg(1);
+         if (first_arg->getType()->isIntegerTy() && second_arg->getType()->isIntegerTy()) {
+-            for (const auto& user : listen_fn->users()) {
+-                if(CallInst* call_ins = dyn_cast<CallInst>(user)) {
+-                    dbgs() << *call_ins << "\n";
+-                    IRBuilder<> ins_builder(call_ins->getNextNode());
+-                    ins_builder.CreateCall(listen_hook_fn);
+-                }
++            auto listen_callsites = collect_callsites(listen_fn);
++            for (auto *call_base : listen_callsites) {
++                insert_hook_after_callsite(call_base, listen_hook_fn, "listen");
+             }
+         }
+     }
+@@ -255,24 +290,18 @@ bool FuzztructionSourcePass::initializeFuzzingStub(Module &M) {
+     auto bind_hook_fn = M.getOrInsertFunction("__ft_after_bind", FunctionType::getVoidTy(M.getContext()));
+     auto bind_fn = M.getFunction("bind");
+     if (bind_fn && bind_fn->arg_size() == 3) {
+-        for (const auto& user : bind_fn->users()) {
+-            if(CallInst* call_ins = dyn_cast<CallInst>(user)) {
+-                dbgs() << *call_ins << "\n";
+-                IRBuilder<> ins_builder(call_ins->getNextNode());
+-                ins_builder.CreateCall(bind_hook_fn);
+-            }
++        auto bind_callsites = collect_callsites(bind_fn);
++        for (auto *call_base : bind_callsites) {
++            insert_hook_after_callsite(call_base, bind_hook_fn, "bind");
+         }
+     }
+ 
+     auto connect_hook_fn = M.getOrInsertFunction("__ft_after_connect", FunctionType::getVoidTy(M.getContext()));
+     auto connect_fn = M.getFunction("connect");
+     if (connect_fn && connect_fn->arg_size() == 3) {
+-        for (const auto& user : connect_fn->users()) {
+-            if(CallInst* call_ins = dyn_cast<CallInst>(user)) {
+-                dbgs() << "patching connect call: " << *call_ins << "\n";
+-                IRBuilder<> ins_builder(call_ins->getNextNode());
+-                ins_builder.CreateCall(connect_hook_fn);
+-            }
++        auto connect_callsites = collect_callsites(connect_fn);
++        for (auto *call_base : connect_callsites) {
++            insert_hook_after_callsite(call_base, connect_hook_fn, "connect");
+         }
+     }
+ 
+@@ -281,7 +310,9 @@ bool FuzztructionSourcePass::initializeFuzzingStub(Module &M) {
+ 
+ 
+ /*
+-Delete call if one of the functions specified by name is called
++Delete call if one of the functions specified by name is called.
++
++In fact, the FT_NOP_FN is not used in FT-Net experiments. So no functions will be deleted~
+ */
+ bool FuzztructionSourcePass::maybeDeleteFunctionCall(Module &M, CallInst *call_ins, std::set<std::string> &target_functions) {
+     Function *callee = call_ins->getCalledFunction();
+@@ -351,7 +382,12 @@ uint64_t get_alloction_size_in_bits(AllocaInst *ins, Value *target) {
+     }
+ }
+ 
+-
++/***
++ * Instrument custom patch points.
++ * 
++ * Randomly mutate the byte returns by the __ft_get_byte, using patchpoint.
++ * But actually, the __ft_get_byte(s) is not used in FT-Net
++ */
+ bool FuzztructionSourcePass::instrumentCustomPatchPoints(Module &M, Function *stackmap_intr) {
+     auto custom_patch_points_enables = env_var_set("FT_CUSTOM_PATCH_POINTS");
+ 
+@@ -387,7 +423,9 @@ bool FuzztructionSourcePass::instrumentCustomPatchPoints(Module &M, Function *st
+     return true;
+ }
+ 
+-
++/**
++ * Instrument the entry block of a function to randomly select a target function and inject it.
++ */
+ bool FuzztructionSourcePass::instrumentFunctionEntry(Function &instrumented_function, Function *stackmap_intr) {
+     auto call_injection_enabled = env_var_set("FT_CALL_INJECTION");
+     if (!call_injection_enabled || instrumented_function.isVarArg()) {
+@@ -620,6 +658,21 @@ bool FuzztructionSourcePass::instrumentInsArg(Module &M, Function *stackmap_intr
+     return true;
+ }
+ 
++/***
++ * Instrument a call instruction.
++ * 
++ * Insert a patchpoint before the call instruction to decide whether the call should be executed or not.
++ *  Head
++ * cond = alloca
++ * store cond, true
++ * patchpoint(cond, 1)
++ * mutated_cond = load cond
++    if (mutated_cond)
++    {
++        Original Call Instruction
++    }
++    Tail
++ */
+ bool FuzztructionSourcePass::instrumentCall(Module &M, Function *stackmap_intr, CallInst *call) {
+     if (!call->user_empty())
+         return false;
+@@ -741,6 +794,9 @@ bool FuzztructionSourcePass::injectPatchPoints(Module &M) {
+             }
+     }
+ 
++    /**
++     * may delete calls to abort() like termination function specified in abort_fn_callees.
++     */
+     for (auto call_ins: abort_fn_callees) {
+         dbgs() << "Deleting call to abort " << *call_ins << "\n";
+         auto bb = call_ins->getParent();
+diff --git a/lib/jail/src/jail.rs b/lib/jail/src/jail.rs
+index 3aa7cd0..003b65d 100644
+--- a/lib/jail/src/jail.rs
++++ b/lib/jail/src/jail.rs
+@@ -39,7 +39,7 @@ where
+     }
+ }
+ 
+-fn internal_drop_privileges(uid: u32, gid: u32, permanent: bool) -> Result<()> {
++pub fn internal_drop_privileges(uid: u32, gid: u32, permanent: bool) -> Result<()> {
+     if permanent {
+         unsafe {
+             wrap_libc(|| libc::setgid(gid))?;
+@@ -118,12 +118,13 @@ impl Jail {
+         // Mount the bear minimum to allow execution of software.
+ 
+         // Mount / into our new root
+-        Jail::mount(&["--bind", "-o", "-ro", "/", &self.new_root])
++        Jail::mount(&["--bind", "-o", "ro", "/", &self.new_root])
+             .context("Failed to mount / into new root")?;
+         Jail::remount_bind_mount_ro(&self.new_root).context("Failed to remount / as ro")?;
+ 
+         let default_ro_source_dirs = [
+-            "/home/user/fuzztruction",
++            "/home/user/profuzzbench",
++            "/home/user/fuzztruction-net",
+             "/etc/hosts",
+             "/etc/hostname",
+             "/etc/resolv.conf",
+@@ -134,8 +135,12 @@ impl Jail {
+             Jail::remount_bind_mount_ro(&dst).context("Failed to remount as ro")?;
+         }
+ 
+-        let dst = format!("{}{}", &self.new_root, "/home/user/fuzztruction/eval-result");
+-        Jail::mount(&["--bind",  "/home/user/fuzztruction/eval-result", &dst]).context("Failed to mount eval-result RW")?;
++        let dst = format!(
++            "{}{}",
++            &self.new_root, "/home/user/fuzztruction-net/eval-result"
++        );
++        Jail::mount(&["--bind", "/home/user/fuzztruction-net/eval-result", &dst])
++            .context("Failed to mount eval-result RW")?;
+ 
+         // Mount /proc, /sys and /dev. These are shared since they are also marked as shared in the "parent" namespace.
+         Jail::mount(&["-o", "bind", "/proc", &format!("{}/proc", self.new_root)])
+diff --git a/scheduler/src/checks.rs b/scheduler/src/checks.rs
+index 2689dde..8675a6a 100644
+--- a/scheduler/src/checks.rs
++++ b/scheduler/src/checks.rs
+@@ -119,6 +119,60 @@ fn check_file_limit() -> Result<()> {
+     Ok(())
+ }
+ 
++fn check_msgqueue_limit() -> Result<()> {
++    const DEFAULT_TARGET_MSGQUEUE_BYTES: u64 = 33_554_432;
++    let target_limit = std::env::var("FT_RLIMIT_MSGQUEUE")
++        .ok()
++        .and_then(|value| value.parse::<u64>().ok())
++        .unwrap_or(DEFAULT_TARGET_MSGQUEUE_BYTES);
++
++    let (mut soft_limit, mut hard_limit) =
++        getrlimit(Resource::RLIMIT_MSGQUEUE).context("Failed to read RLIMIT_MSGQUEUE")?;
++    log::info!(
++        "Current RLIMIT_MSGQUEUE soft={} hard={} target={}",
++        soft_limit,
++        hard_limit,
++        target_limit
++    );
++
++    // While we still run with elevated privileges (sudo/root), try to raise
++    // both hard and soft to the configured target first.
++    if hard_limit < target_limit || soft_limit < target_limit {
++        match setrlimit(Resource::RLIMIT_MSGQUEUE, target_limit, target_limit) {
++            Ok(()) => {
++                let (new_soft, new_hard) = getrlimit(Resource::RLIMIT_MSGQUEUE)
++                    .context("Failed to re-read RLIMIT_MSGQUEUE after raise")?;
++                soft_limit = new_soft;
++                hard_limit = new_hard;
++                log::info!(
++                    "Raised RLIMIT_MSGQUEUE to soft={} hard={}",
++                    soft_limit,
++                    hard_limit
++                );
++            }
++            Err(err) => {
++                log::warn!(
++                    "Failed to raise RLIMIT_MSGQUEUE hard/soft to {}: {:#?}",
++                    target_limit,
++                    err
++                );
++            }
++        }
++    }
++
++    // Fallback: at least raise soft to current hard to maximize usable quota.
++    if soft_limit < hard_limit {
++        log::info!(
++            "Increasing RLIMIT_MSGQUEUE soft to current hard={}",
++            hard_limit
++        );
++        setrlimit(Resource::RLIMIT_MSGQUEUE, hard_limit, hard_limit)
++            .context("Failed to raise RLIMIT_MSGQUEUE soft to hard")?;
++    }
++
++    Ok(())
++}
++
+ fn check_mqueue_queues_max() -> Result<()> {
+     let procfs_file = "/proc/sys/fs/mqueue/queues_max";
+     let limit: u64 = fs::read_to_string(procfs_file)?.trim().parse().unwrap();
+@@ -130,13 +184,14 @@ fn check_mqueue_queues_max() -> Result<()> {
+ 
+ /// Check if all requirements to run this software are satisfied.
+ pub fn check_system() -> Result<()> {
+-    check_core_pattern_is_core()?;
+-    check_fs_suid_dumpable()?;
+-    check_if_tmp_is_tmpfs()?;
++    // check_core_pattern_is_core()?;
++    // check_fs_suid_dumpable()?;
++    // check_if_tmp_is_tmpfs()?;
+     check_if_agent_is_in_path()?;
+-    check_scaling_governor()?;
+-    check_perf_event_paranoid()?;
++    // check_scaling_governor()?;
++    // check_perf_event_paranoid()?;
+     check_file_limit()?;
++    check_msgqueue_limit()?;
+     check_mqueue_queues_max()?;
+     Ok(())
+ }
+diff --git a/scheduler/src/cli/fuzztruction.rs b/scheduler/src/cli/fuzztruction.rs
+index eb8c21d..6f0453f 100644
+--- a/scheduler/src/cli/fuzztruction.rs
++++ b/scheduler/src/cli/fuzztruction.rs
+@@ -7,7 +7,7 @@ mod stackmap_parser;
+ mod test_patchpoints;
+ mod util;
+ 
+-use anyhow::{anyhow, Context, Result};
++use anyhow::{Context, Result};
+ 
+ use std::env;
+ use std::path::PathBuf;
+@@ -358,6 +358,38 @@ fn parse_args() -> ArgMatches {
+             Command::new("dump-stackmap")
+                 .about("Dump the LLVM stackmap (e.g., locations and sizes)")
+         )
++        .subcommand(
++            Command::new("gcov")
++                .about("Run gcov for each insteresting input found.")
++                .arg(
++                    Arg::new("timeout")
++                        .help("Timeout after that a testcase is considered hanging and skipped in consequence")
++                        .short('t')
++                        .long("timeout")
++                        .takes_value(true)
++                        .default_value("1s"),
++                ).arg(
++                    Arg::new("delete")
++                    .long("delete")
++                    .short('d')
++                    .help("Rerun the coverage computation and delete previous results, if any")
++                    .action(clap::ArgAction::SetTrue)
++                ).arg(
++                    Arg::new("replay-step")
++                        .help("Replay the inputs found in the given step. If $i % $replay_step == 0, the input is replayed.")
++                        .short('r')
++                        .long("replay-step")
++                        .takes_value(true)
++                        .default_value("1"),
++                ).arg(
++                    Arg::new("gcov-step")
++                        .help("Run gcov for each insteresting input found in the given step. If $i % $gcov_step == 0, gcov is run.")
++                        .short('g')
++                        .long("gcov-step")
++                        .takes_value(true)
++                        .default_value("1"),
++                )
++        )
+         .subcommand(
+             Command::new("test-patchpoints")
+             .about("Test the patchpoints of the source application (for debugging)")
+@@ -372,9 +404,9 @@ fn parse_args() -> ArgMatches {
+     matches
+ }
+ 
+-/// Check whether the workdir already exists and raises an error if --purge
+-/// was not passed. If this function returns `Ok`, the workdir is empty, but
+-/// exists.
++/// Check whether the workdir already exists.
++/// If `--purge` is passed, existing content is removed for run modes that
++/// expect an empty directory. Otherwise we keep existing content and continue.
+ fn check_workdir(config: &mut Config, matches: &ArgMatches) -> Result<()> {
+     let purge_flag = matches.get_flag("purge");
+ 
+@@ -387,15 +419,22 @@ fn check_workdir(config: &mut Config, matches: &ArgMatches) -> Result<()> {
+     // Purge the working directory if requested.
+     if config.general.work_dir.exists() && expects_empty_dir {
+         if purge_flag {
+-            std::fs::remove_dir_all(&config.general.work_dir).unwrap_or_else(|_| {
+-                panic!("Failed to remove workdir {:?}", config.general.work_dir)
+-            });
+-            std::fs::create_dir_all(&config.general.work_dir)?;
++            let dir_entries = std::fs::read_dir(&config.general.work_dir)
++                .unwrap_or_else(|_| panic!("Failed to read workdir {:?}", config.general.work_dir));
++            for entry in dir_entries {
++                let entry = entry.unwrap();
++                let path = entry.path();
++                if path.is_dir() {
++                    std::fs::remove_dir_all(path).unwrap();
++                } else {
++                    std::fs::remove_file(path).unwrap();
++                }
++            }
+         } else {
+-            return Err(anyhow!(
+-                "Workdir {:?} exists and --purge was not provided!",
++            log::warn!(
++                "Workdir {:?} exists and --purge was not provided. Continuing without cleaning.",
+                 config.general.work_dir
+-            ));
++            );
+         }
+     }
+     Ok(())
+@@ -507,6 +546,10 @@ fn real_main() -> Result<()> {
+             handler::handle_cli_llvm_cov_subcommand(llvm_cov_matches, &config)
+                 .expect("Failed to run llvm-cov subcommand");
+         }
++        Some(("gcov", matches)) => {
++            handler::handle_cli_gcov_subcommand(matches, &config)
++                .expect("Failed to run gcov subcommand");
++        }
+         Some(("aflnet", matches)) => {
+             handler::handle_cli_aflnet_subcommand(matches, &config)
+                 .expect("Failed to run AFLNet mode");
+@@ -565,8 +608,10 @@ fn replace_workdir(config: &mut Config, matches: &ArgMatches) {
+ 
+ fn configure_jail(config: &mut Config) -> Result<()> {
+     if config.general.jail_drop_to_sudo_callee {
+-        let uid = env::var("SUDO_UID").context("Failed to get SUDO_UID from environment. Please run via sudo or as root.")?;
+-        let gid = env::var("SUDO_GID").context("Failed to get SUDO_GID from environment. Please run via sudo or as root")?;
++        let uid = env::var("SUDO_UID")
++            .context("Failed to get SUDO_UID from environment. Please run via sudo or as root.")?;
++        let gid = env::var("SUDO_GID")
++            .context("Failed to get SUDO_GID from environment. Please run via sudo or as root")?;
+         log::info!("Privileges will be dropped to uid: {uid:?} and gid: {gid:?}");
+         config.general.jail_uid = Some(uid.parse().unwrap());
+         config.general.jail_gid = Some(gid.parse().unwrap());
+diff --git a/scheduler/src/cli/handler.rs b/scheduler/src/cli/handler.rs
+index e98c37a..84ccd01 100644
+--- a/scheduler/src/cli/handler.rs
++++ b/scheduler/src/cli/handler.rs
+@@ -1,4 +1,7 @@
+ use std::{
++    fs,
++    path::Path,
++    process::{Command, Stdio},
+     sync::{self, atomic::AtomicBool, Arc},
+     time::{Duration, Instant},
+ };
+@@ -271,6 +274,64 @@ pub(crate) fn handle_cli_sgfuzz_subcommand(matches: &ArgMatches, config: &Config
+     Ok(())
+ }
+ 
++// Recursively delete all the gcda files in the src-dir
++pub fn cleanup_gcda(dir: &Path) -> std::io::Result<()> {
++    if dir.is_dir() {
++        for entry in fs::read_dir(dir)? {
++            let entry = entry?;
++            let path = entry.path();
++            if path.is_dir() {
++                cleanup_gcda(&path)?;
++            } else if let Some(extension) = path.extension() {
++                if extension == "gcda" {
++                    fs::remove_file(path)?;
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++pub(crate) fn handle_cli_gcov_subcommand(
++    trace_matches: &ArgMatches,
++    config: &Config,
++) -> Result<()> {
++    let termination_flag = register_on_termination_flag();
++    let timeout = trace_matches
++        .value_of("timeout")
++        .map(|e| e.parse::<CliDuration>().unwrap())
++        .map(|v| v.0)
++        .unwrap();
++
++    if trace_matches.get_flag("delete") {
++        cleanup_gcda(config.gcov.as_ref().unwrap().src_dir.as_ref())?;
++    }
++    let replay_step: u32 = trace_matches
++        .value_of("replay-step")
++        .map(|v| v.parse().unwrap())
++        .unwrap_or(1);
++    let gcov_step: u32 = trace_matches
++        .value_of("gcov-step")
++        .map(|v| v.parse().unwrap())
++        .unwrap_or(1);
++
++    log::info!("Timeout is set to {timeout:?}");
++
++    coverage::networked::compute_gcov(
++        config,
++        termination_flag.clone(),
++        timeout,
++        replay_step,
++        gcov_step,
++    )?;
++
++    if termination_flag.load(std::sync::atomic::Ordering::SeqCst) {
++        return Ok(());
++    }
++
++    Ok(())
++}
++
+ pub(crate) fn handle_cli_llvm_cov_subcommand(
+     trace_matches: &ArgMatches,
+     config: &Config,
+diff --git a/scheduler/src/config.rs b/scheduler/src/config.rs
+index 036e283..cd0f411 100644
+--- a/scheduler/src/config.rs
++++ b/scheduler/src/config.rs
+@@ -214,6 +214,9 @@ pub struct SinkConfig {
+     /// The working directory that should be used.
+     pub working_dir: Option<PathBuf>,
+     pub send_sigterm: bool,
++    /// Treat sink as a persistent server that should be actively terminated
++    /// by the scheduler after producer/client is done.
++    pub persistent_server: bool,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -289,6 +292,17 @@ pub struct StateAflConfig {
+     pub enable_state_aware_mode: bool,
+ }
+ 
++#[derive(Debug, Clone, Serialize)]
++pub struct GcovConfig {
++    pub bin_path: PathBuf,
++    pub env: Vec<(String, String)>,
++    pub src_dir: PathBuf,
++    pub cwd: PathBuf,
++    pub reporter: String,
++    pub gcovr_args: Vec<String>,
++    pub send_sigterm: bool,
++}
++
+ #[derive(Debug, Clone, Serialize)]
+ pub struct VanillaConfig {
+     /// Environment used during binary
+@@ -444,6 +458,8 @@ pub struct Config {
+     pub stateafl: Option<StateAflConfig>,
+     /// Config for the SGFuzz fuzzer.
+     pub sgfuzz: Option<SGFuzzConfig>,
++
++    pub gcov: Option<GcovConfig>,
+ }
+ 
+ impl Config {
+@@ -1028,6 +1044,7 @@ impl ConfigBuilder {
+                 "sink-cov",
+                 "source",
+                 "afl-net",
++                "gcov",
+                 "state-afl",
+                 "sgfuzz",
+                 "vanilla",
+@@ -1290,6 +1307,41 @@ impl ConfigBuilder {
+         })
+     }
+ 
++    fn parse_gcov_section(&self, yaml: &Yaml) -> Result<GcovConfig> {
++        let bin_path = self.get_attribute(yaml, "bin-path")?;
++        let env: Option<Vec<(String, String)>> = self.get_attribute(yaml, "env")?;
++        let env = env.unwrap_or_default();
++        let src_dir = self.get_attribute(yaml, "src-dir")?;
++        let cwd = self.get_attribute(yaml, "cwd")?;
++        let reporter = self.get_attribute(yaml, "reporter")?;
++        let gcovr_args = self
++            .get_attribute::<Option<Vec<String>>>(yaml, "gcovr-args")?
++            .unwrap_or_default();
++        let send_sigterm = self.get_attribute::<Option<bool>>(yaml, "send-sigterm")?;
++        ConfigBuilder::check_for_unparsed_keys(
++            yaml,
++            &[
++                "bin-path",
++                "env",
++                "src-dir",
++                "reporter",
++                "gcovr-args",
++                "send-sigterm",
++                "cwd",
++            ],
++        )?;
++
++        Ok(GcovConfig {
++            bin_path,
++            env,
++            src_dir,
++            cwd,
++            reporter,
++            gcovr_args,
++            send_sigterm: send_sigterm.unwrap_or(false),
++        })
++    }
++
+     fn parse_state_afl_section(&self, yaml: &Yaml) -> Result<StateAflConfig> {
+         let bin_path = self.get_attribute(yaml, "bin-path")?;
+         let env: Option<Vec<(String, String)>> = self.get_attribute(yaml, "env")?;
+@@ -1368,6 +1420,9 @@ impl ConfigBuilder {
+         let send_sigterm = self
+             .get_attribute::<Option<bool>>(yaml, "send-sigterm")?
+             .unwrap_or(false);
++        let persistent_server = self
++            .get_attribute::<Option<bool>>(yaml, "persistent-server")?
++            .unwrap_or(false);
+ 
+         ConfigBuilder::check_for_unparsed_keys(
+             yaml,
+@@ -1386,6 +1441,7 @@ impl ConfigBuilder {
+                 "server-ready-on",
+                 "working-dir",
+                 "send-sigterm",
++                "persistent-server",
+             ],
+         )
+         .context("Sink")?;
+@@ -1404,6 +1460,7 @@ impl ConfigBuilder {
+             server_ready_on,
+             working_dir,
+             send_sigterm,
++            persistent_server,
+         })
+     }
+ 
+@@ -1477,6 +1534,13 @@ impl ConfigBuilder {
+             Some(self.parse_afl_net_section(aflnet_section)?)
+         };
+ 
++        let gcov_section = &yaml["gcov"];
++        let gcov_config = if gcov_section.is_null() || gcov_section.is_badvalue() {
++            None
++        } else {
++            Some(self.parse_gcov_section(gcov_section)?)
++        };
++
+         let stateafl_section = &yaml["state-afl"];
+         let stateafl_section = if stateafl_section.is_badvalue() {
+             None
+@@ -1508,6 +1572,7 @@ impl ConfigBuilder {
+             sgfuzz: sgfuzz_section,
+             sink_cov: sink_cov_config,
+             vanilla: vanilla_config,
++            gcov: gcov_config,
+         };
+         config.validate()?;
+         Ok(config)
+diff --git a/scheduler/src/constants.rs b/scheduler/src/constants.rs
+index 463594a..6e57a20 100644
+--- a/scheduler/src/constants.rs
++++ b/scheduler/src/constants.rs
+@@ -5,7 +5,7 @@ use std::time::Duration;
+ /// Programmes containing more than this limit, will raise an assertion.
+ /// In this case, the limit might simply be raised to the desired value, however,
+ /// mind that this will increase the overall memory footprint.
+-pub const MAX_PATCHPOINT_CNT: usize = 400_000;
++pub const MAX_PATCHPOINT_CNT: usize = 600_000;
+ pub const MAX_QUEUE_ENTRY_CNT: usize = 100000;
+ pub const EXECUTION_TIMEOUT_MULTIPLYER: f64 = 2.0;
+ pub const AVG_EXECUTION_TIME_STABILIZATION_VALUE: u32 = 100;
+diff --git a/scheduler/src/coverage/mod.rs b/scheduler/src/coverage/mod.rs
+index bdedb83..0ed5e02 100644
+--- a/scheduler/src/coverage/mod.rs
++++ b/scheduler/src/coverage/mod.rs
+@@ -7,6 +7,7 @@ use crate::config::{Config, SinkCovConfig};
+ 
+ pub mod aflnet;
+ pub mod classic;
++pub mod grcov;
+ pub mod networked;
+ pub mod sgfuzz;
+ pub mod stateafl;
+diff --git a/scheduler/src/coverage/grcov.rs b/scheduler/src/coverage/grcov.rs
+new file mode 100644
+index 0000000..2d0c728
+--- /dev/null
++++ b/scheduler/src/coverage/grcov.rs
+@@ -0,0 +1,142 @@
++use std::{env, fs, io::{BufRead, BufReader}, path::{Path, PathBuf}, process::Stdio};
++
++use anyhow::{anyhow, Context, Result};
++
++#[derive(Debug, Clone)]
++pub enum GrcovBinary {
++    Grcov,
++    Gcovr
++}
++
++impl From<String> for GrcovBinary {
++    fn from(s: String) -> Self {
++        match s.as_str() {
++            "grcov" => GrcovBinary::Grcov,
++            "gcovr" => GrcovBinary::Gcovr,
++            _ => panic!("Invalid gcov reporter binary: {}", s),
++        }
++    }
++}
++
++impl Into<String> for GrcovBinary {
++    fn into(self) -> String {
++        match self {
++            GrcovBinary::Grcov => "grcov".to_string(),
++            GrcovBinary::Gcovr => "gcovr".to_string(),
++        }
++    }
++}
++
++#[derive(Debug)]
++pub struct Grcov {
++    bin_path: PathBuf,
++    binary: GrcovBinary,
++    args: Vec<String>,
++    cwd: PathBuf,
++}
++
++#[derive(Debug, Default)]
++pub struct Coverage {
++    pub branches_hit: u64,
++    pub branches_total: u64,
++    pub lines_hit: u64,
++    pub lines_total: u64,
++}
++
++impl Grcov {
++    pub fn build(binary: GrcovBinary, args: Vec<String>, cwd: PathBuf) -> Result<Grcov> {
++        let bin: String = binary.clone().into();
++                
++        let which_output = std::process::Command::new("which")
++            .arg(&bin)
++            .output()
++            .context(format!("Failed to execute 'which {}'", bin))?;
++
++        let bin_path = if which_output.status.success() {
++            let bin_path = String::from_utf8(which_output.stdout)
++                .context(format!("Failed to parse 'which {} output", bin))?
++                .trim()
++                .to_string();
++
++            let bin_path = PathBuf::from(bin_path);
++            if !bin_path.exists() {
++                return Err(anyhow!("{} not found at the path returned by 'which'", bin));
++            }
++
++            bin_path
++        } else {
++            let home_dir = env::var_os("HOME")
++                .or_else(|| env::var_os("USERPROFILE"))
++                .map(PathBuf::from)
++                .unwrap();
++
++            let cargo_bin = home_dir.join(".cargo").join("bin").join(bin.clone());
++            if !cargo_bin.exists() {
++                return Err(anyhow!("{} not found in $HOME/.cargo/bin folder", bin));
++            }
++
++            cargo_bin
++        };
++
++        Ok(Grcov {
++            bin_path,
++            binary,
++            args,
++            cwd,
++        })
++    }
++
++    pub fn spawn(&self) -> Result<Coverage> {
++        let output = std::process::Command::new(self.bin_path.to_str().unwrap())
++            .args(self.args.to_owned())
++            .current_dir(&self.cwd)
++            .stdout(Stdio::piped())
++            .spawn()
++            .map_err(|e| {
++                anyhow!(
++                    "Error in spawning: {:?} {:#?}, caused by: {:#?}",
++                    self.binary,
++                    self.args,
++                    e
++                )
++            })?
++            .stdout
++            .expect(format!("{:?} process returns empty", self.binary).as_str());
++
++        let mut coverage = Coverage::default();
++
++        let reader = BufReader::new(output);
++        for line in reader.lines() {
++            let line = line?;
++            let parts: Vec<&str> = line.split(':').collect();
++
++            match parts[0] {
++                "LF" => coverage.lines_total += parts[1].parse::<u64>().unwrap_or(0),
++                "LH" => coverage.lines_hit += parts[1].parse::<u64>().unwrap_or(0),
++                "BRF" => coverage.branches_total += parts[1].parse::<u64>().unwrap_or(0),
++                "BRH" => coverage.branches_hit += parts[1].parse::<u64>().unwrap_or(0),
++                _ => {} // Ignore other lines
++            }
++        }
++
++        Ok(coverage)
++    }
++}
++
++// Recursively delete all the gcda files in the src-dir
++pub fn cleanup_gcda(dir: &Path) -> std::io::Result<()> {
++    if dir.is_dir() {
++        for entry in fs::read_dir(dir)? {
++            let entry = entry?;
++            let path = entry.path();
++            if path.is_dir() {
++                cleanup_gcda(&path)?;
++            } else if let Some(extension) = path.extension() {
++                if extension == "gcda" {
++                    fs::remove_file(path)?;
++                }
++            }
++        }
++    }
++    Ok(())
++}
+\ No newline at end of file
+diff --git a/scheduler/src/coverage/networked.rs b/scheduler/src/coverage/networked.rs
+index 8886de7..ea7bcfc 100644
+--- a/scheduler/src/coverage/networked.rs
++++ b/scheduler/src/coverage/networked.rs
+@@ -1,26 +1,58 @@
+ use std::{
+     cell::RefCell,
+-    fs,
+-    process::Command,
++    env,
++    ffi::{CStr, CString},
++    fs::{self, OpenOptions},
++    io::{BufRead, BufReader, Write},
++    iter::once,
++    os::fd::AsRawFd,
++    path::PathBuf,
++    process::{Command, Stdio},
++    ptr,
+     sync::{
+         atomic::{self, AtomicBool},
+         Arc,
+     },
++    thread::{self, sleep},
+     time::{Duration, Instant},
+ };
+ 
+ use crate::{
+     config::Config,
+-    coverage::write_cov_binary_info,
++    coverage::{
++        grcov::{Grcov, GrcovBinary},
++        write_cov_binary_info,
++    },
+     fuzzer::queue::{Queue, QueueEntry},
+     networked::{get_consumer, get_producer, Client, Server, WaitForPeerResult},
+     sink::AflSink,
+     source::Source,
+ };
+ 
++use anyhow::anyhow;
+ use anyhow::Result;
++use chrono::Local;
+ use fuzztruction_shared::mutation_cache::MutationCache;
+ use itertools::Itertools;
++use jail::jail::{internal_drop_privileges, Jail, JailBuilder};
++use libc::{c_char, fork};
++use nix::unistd::execve;
++
++fn install_idle_stdin() {
++    let mut pipe_fds = [0; 2];
++    let ret = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
++    if ret != 0 {
++        panic!("Failed to create idle stdin pipe");
++    }
++
++    unsafe {
++        libc::dup2(pipe_fds[0], libc::STDIN_FILENO);
++        libc::close(pipe_fds[0]);
++    }
++
++    // Keep the write end open so stdin stays blocking instead of becoming EOF.
++    let _write_end = pipe_fds[1];
++}
+ 
+ unsafe fn load_mutations(source: &mut Source, entry: &QueueEntry) -> Result<()> {
+     let mutations = entry.mutations();
+@@ -39,6 +71,264 @@ unsafe fn load_mutations(source: &mut Source, entry: &QueueEntry) -> Result<()>
+     Ok(())
+ }
+ 
++pub fn compute_gcov(
++    config: &Config,
++    exit_requested: Arc<AtomicBool>,
++    timeout: Duration,
++    replay_step: u32,
++    gcov_step: u32,
++) -> Result<()> {
++    let gcov_config = config.gcov.as_ref().unwrap();
++
++    let grcov_args = match gcov_config.reporter.to_owned().into() {
++        GrcovBinary::Grcov => {
++            vec![
++                "--threads",
++                "2",
++                "-t",
++                "lcov",
++                "--branch",
++                "--ignore-not-existing",
++                "-s",
++                gcov_config.src_dir.to_str().unwrap(),
++                gcov_config.cwd.to_str().unwrap(),
++            ]
++        }
++        GrcovBinary::Gcovr => {
++            let mut args = vec!["--lcov", "-r", gcov_config.src_dir.to_str().unwrap()];
++            for arg in gcov_config.gcovr_args.iter() {
++                args.push(arg.as_str());
++            }
++            args
++        }
++    }
++    .into_iter()
++    .map(|s| s.into())
++    .collect();
++
++    let grcov = Grcov::build(
++        gcov_config.reporter.to_owned().into(),
++        grcov_args,
++        gcov_config.cwd.to_owned(),
++    )?;
++
++    let mut cov_tmp_file = tempfile::NamedTempFile::new().unwrap();
++    log::debug!(
++        "Coverage temp file: {}",
++        cov_tmp_file.path().to_str().unwrap()
++    );
++    cov_tmp_file
++        .write_all("time,l_abs,l_per,b_abs,b_per\n".as_bytes())
++        .unwrap();
++
++    let queue_path = config.general.queue_path();
++    log::info!("Loading queue at {queue_path:?} from disk...");
++    let queue = Queue::load(&queue_path, None)?;
++    log::info!("Tracing {} queue entries", queue.len());
++
++    let mut source = Source::from_config(config, None, Some("gcov")).unwrap();
++    source.start().expect("Failed to start source");
++    let _pp = source.get_patchpoints()?;
++
++    let mock_time = Local::now();
++
++    for (idx, entry) in queue.iter().sorted_by_key(|q| q.id().0).enumerate() {
++        if idx % replay_step as usize != 0 {
++            continue;
++        }
++
++        if exit_requested.load(atomic::Ordering::SeqCst) {
++            break;
++        }
++
++        log::info!("Processing queue entry {:?}", entry.id());
++        let ts = (entry.creation_ts().unwrap() + mock_time.timestamp_millis()) / 1000;
++        unsafe {
++            load_mutations(&mut source, &entry)?;
++        }
++        source.sync_mutations()?;
++
++        let pid = unsafe { fork() };
++
++        if pid == 0 {
++            unsafe {
++                let ret = libc::setsid();
++                assert!(ret >= 0);
++            }
++
++            let (uid, gid) = config.general.jail_uid_gid().unwrap();
++            internal_drop_privileges(uid, gid, true).unwrap();
++
++            let dev_null_fd = unsafe {
++                let path = CString::new("/dev/null".as_bytes()).unwrap();
++                libc::open(path.as_ptr(), libc::O_RDONLY)
++            };
++            if dev_null_fd < 0 {
++                panic!("Failed to open /dev/null");
++            }
++
++            let mut sink_workdir = config.general.work_dir.to_owned();
++            sink_workdir.push("0-gcov");
++            sink_workdir.push("sink");
++            sink_workdir.push("workdir");
++
++            if !sink_workdir.exists() {
++                fs::create_dir_all(&sink_workdir).expect("Failed to create sink workdir");
++            }
++
++            if config.sink.log_stdout {
++                let mut path = sink_workdir.to_owned();
++                path.push("stdout");
++                let file = OpenOptions::new()
++                    .read(true)
++                    .write(true)
++                    .create(true)
++                    .truncate(true)
++                    .open(&path)
++                    .unwrap();
++                let fd = file.as_raw_fd();
++                unsafe {
++                    libc::dup2(fd, libc::STDOUT_FILENO);
++                    libc::close(fd);
++                }
++            } else {
++                unsafe {
++                    libc::dup2(dev_null_fd, libc::STDOUT_FILENO);
++                }
++            }
++
++            if config.sink.log_stderr {
++                let mut path = sink_workdir.to_owned();
++                path.push("stderr");
++                let file = OpenOptions::new()
++                    .read(true)
++                    .write(true)
++                    .create(true)
++                    .truncate(true)
++                    .open(&path)
++                    .unwrap();
++                let fd = file.as_raw_fd();
++                unsafe {
++                    libc::dup2(fd, libc::STDERR_FILENO);
++                    libc::close(fd);
++                }
++            } else {
++                unsafe {
++                    libc::dup2(dev_null_fd, libc::STDERR_FILENO);
++                }
++            }
++
++            // Prevent OpenSSL s_server from seeing stdin EOF and exiting right
++            // after accept().
++            install_idle_stdin();
++
++            // is child
++            let mut argv: Vec<CString> = config
++                .sink
++                .arguments
++                .iter()
++                .map(|arg| CString::new(arg.to_owned()).unwrap())
++                .collect();
++            let bin_path = gcov_config.bin_path.to_str().unwrap();
++            let bin = CString::new(bin_path).unwrap();
++            argv.insert(0, bin.clone());
++            println!("execve({}, {:#?})", bin_path, argv);
++
++            env::set_current_dir(config.gcov.as_ref().unwrap().cwd.to_owned()).unwrap();
++
++            let envs: Vec<CString> = config
++                .gcov
++                .as_ref()
++                .unwrap()
++                .env
++                .iter()
++                .map(|e| CString::new(format!("{}={}", e.0, e.1)).unwrap())
++                .collect();
++            // thread::sleep(Duration::from_secs(30));
++            log::trace!("Environment variables: {:#?}", envs);
++
++            if let Err(e) = execve(&bin, &argv, &envs) {
++                log::error!("Error in execve: {:#?}", e);
++                let error = std::io::Error::last_os_error();
++                log::error!("Last OS error: {:#?}", error);
++                std::process::exit(1);
++            }
++            unreachable!("Unreachable: execve returned");
++        } else if pid > 0 {
++            // is parent
++        } else {
++            // pid < 0
++            return Err(anyhow!("Fork failed!"));
++        }
++
++        log::debug!("Target pid: {pid}");
++
++        // is parent
++        if wait_listening(
++            pid,
++            config.sink.server_port.as_ref().unwrap().parse().unwrap(),
++            true,
++            timeout,
++        )
++        .is_err()
++        {
++            // thread::sleep(Duration::from_secs(100));
++            return Err(anyhow!(
++                "Timeout in waiting for the process {} to listen on the port {}",
++                pid,
++                config.sink.server_port.as_ref().unwrap()
++            ));
++        }
++
++        source.spawn(timeout)?;
++        thread::sleep(timeout);
++        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGTERM);
++        source.wait_for_child_termination(timeout, true)?;
++
++        if idx % gcov_step as usize != 0 {
++            continue;
++        }
++
++        let coverage = grcov.spawn()?;
++
++        // Compute line coverage ratio
++        let l_per = if coverage.lines_total > 0 {
++            (coverage.lines_hit as f64 / coverage.lines_total as f64) * 100.0
++        } else {
++            0.0
++        };
++
++        // Compute branch coverage ratio
++        let b_per = if coverage.branches_total > 0 {
++            (coverage.branches_hit as f64 / coverage.branches_total as f64) * 100.0
++        } else {
++            0.0
++        };
++
++        // Format the absolute values and percentages
++        let l_abs = coverage.lines_hit;
++        let b_abs = coverage.branches_hit;
++        let l_per = format!("{:.4}", l_per);
++        let b_per = format!("{:.4}", b_per);
++
++        cov_tmp_file
++            .write_all(format!("{ts},{l_abs},{l_per},{b_abs},{b_per}\n").as_bytes())
++            .unwrap();
++        cov_tmp_file.flush().unwrap();
++
++        log::info!("Coverage:\nLine:\t{l_abs}({l_per}%)\nBranch:\t{b_abs}({b_per}%)");
++        log::info!(
++            "Finished measuring coverage of the {idx}-th queue entry, progress: {:.2}%",
++            idx as f64 / queue.len() as f64 * 100f64
++        );
++    }
++
++    let temp_path = cov_tmp_file.into_temp_path();
++    fs::copy(&temp_path, config.general.work_dir.join("coverage.csv")).unwrap();
++
++    Ok(())
++}
++
+ pub fn compute_llvm_cov(
+     config: &Config,
+     exit_requested: Arc<AtomicBool>,
+@@ -183,3 +473,88 @@ pub fn compute_llvm_cov(
+ 
+     Ok(())
+ }
++
++pub fn wait_listening(pid: i32, port: u16, v4: bool, timeout: Duration) -> Result<()> {
++    let start = Instant::now();
++    loop {
++        if is_listening(pid, port, v4)? || is_listening(pid, port, !v4)? {
++            return Ok(());
++        }
++        log::trace!(
++            "Waiting for the process {} to listen on the port {}",
++            pid,
++            port
++        );
++        if start.elapsed() > timeout {
++            return Err(anyhow!(
++                "Timeout in waiting for the process {} to listen on the port {}",
++                pid,
++                port
++            ));
++        }
++        sleep(Duration::from_millis(100));
++    }
++}
++
++fn is_listening(pid: i32, port: u16, v4: bool) -> Result<bool> {
++    let fd_path = format!("/proc/{}/fd", pid);
++    for entry in fs::read_dir(fd_path)? {
++        let entry = entry?;
++        let path = entry.path();
++        if let Ok(target) = fs::read_link(&path) {
++            if target.to_string_lossy().starts_with("socket:[") {
++                let inode = target
++                    .to_string_lossy()
++                    .trim_start_matches("socket:[")
++                    .trim_end_matches(']')
++                    .parse::<u64>()?;
++                if grep_socket_port(inode, port, v4)? {
++                    return Ok(true);
++                }
++            }
++        }
++    }
++    Ok(false)
++}
++
++fn grep_socket_port(inode: u64, port: u16, v4: bool) -> Result<bool> {
++    let (tcp_path, udp_path) = if v4 {
++        ("/proc/net/tcp", "/proc/net/udp")
++    } else {
++        ("/proc/net/tcp6", "/proc/net/udp6")
++    };
++
++    if grep_socket_port_in_table(tcp_path, inode, port)? {
++        return Ok(true);
++    }
++
++    grep_socket_port_in_table(udp_path, inode, port)
++}
++
++fn grep_socket_port_in_table(path: &str, inode: u64, port: u16) -> Result<bool> {
++    let socket_file = fs::File::open(path)?;
++    for line in BufReader::new(socket_file).lines().skip(1) {
++        let line = line?;
++        let parts: Vec<&str> = line.split_whitespace().collect();
++        if parts.len() <= 9 {
++            continue;
++        }
++
++        let local_address = parts[1];
++        let Some((_, local_port_hex)) = local_address.split_once(':') else {
++            continue;
++        };
++        let Ok(local_port) = u16::from_str_radix(local_port_hex, 16) else {
++            continue;
++        };
++        let Ok(socket_inode) = parts[9].parse::<u64>() else {
++            continue;
++        };
++
++        if local_port == port && socket_inode == inode {
++            return Ok(true);
++        }
++    }
++
++    Ok(false)
++}
+diff --git a/scheduler/src/fuzzer/queue.rs b/scheduler/src/fuzzer/queue.rs
+index f0465c8..5afe57c 100644
+--- a/scheduler/src/fuzzer/queue.rs
++++ b/scheduler/src/fuzzer/queue.rs
+@@ -664,15 +664,33 @@ impl Queue {
+ 
+         let entries = files
+             .par_iter()
+-            .map(|file| {
+-                let content = fs::read(file).unwrap();
++            .filter_map(|file| {
++                let content = match fs::read(file) {
++                    Ok(v) => v,
++                    Err(e) => {
++                        log::warn!("Skip unreadable queue file {:?}: {}", file, e);
++                        return None;
++                    }
++                };
++
+                 let mut decompressed = Vec::new();
+                 let mut decompressor = ZlibDecoder::new(&mut decompressed);
+-                decompressor.write_all(&content).unwrap();
+-                decompressor.finish().unwrap();
++                if let Err(e) = decompressor.write_all(&content) {
++                    log::warn!("Skip corrupted queue file {:?} (decompress): {}", file, e);
++                    return None;
++                }
++                if let Err(e) = decompressor.finish() {
++                    log::warn!("Skip corrupted queue file {:?} (finish): {}", file, e);
++                    return None;
++                }
+ 
+-                let qe: QueueEntry = serde_json::from_slice(&decompressed).unwrap();
+-                qe
++                match serde_json::from_slice::<QueueEntry>(&decompressed) {
++                    Ok(qe) => Some(qe),
++                    Err(e) => {
++                        log::warn!("Skip invalid queue entry {:?} (json): {}", file, e);
++                        None
++                    }
++                }
+             })
+             .collect::<Vec<_>>();
+ 
+diff --git a/scheduler/src/fuzzer/worker_impl/init.rs b/scheduler/src/fuzzer/worker_impl/init.rs
+index 728d127..a2d288b 100644
+--- a/scheduler/src/fuzzer/worker_impl/init.rs
++++ b/scheduler/src/fuzzer/worker_impl/init.rs
+@@ -37,15 +37,6 @@ impl FuzzingWorker {
+         self.source = Some(Source::from_config(&self.config, Some(self.uid.0), None)?);
+         self.sink = Some(AflSink::from_config(&self.config, Some(self.uid.0), None)?);
+ 
+-        let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+-        assert!(ret == 0);
+-
+-        let ret = process::Command::new("ip")
+-            .args(["link", "set", "dev", "lo", "up"])
+-            .spawn()?
+-            .wait_with_output()?;
+-        log::info!("ret={:?}", ret);
+-
+         self.source.as_mut().unwrap().start()?;
+         self.sink.as_mut().unwrap().start()?;
+         self.resize_bitmaps();
+diff --git a/scheduler/src/networked.rs b/scheduler/src/networked.rs
+index 9a36e1e..0c2abf9 100644
+--- a/scheduler/src/networked.rs
++++ b/scheduler/src/networked.rs
+@@ -156,7 +156,7 @@ impl Server<'_> {
+                 .wait_for_child_termination(timeout, kill_child)
+                 .map(|v| v.into()),
+             Server::AflSink(sink) => sink
+-                .wait_for_child_termination(timeout, kill_child, None)
++                .wait_for_child_termination(timeout, kill_child, None)
+                 .map(|v| v.into()),
+         }
+     }
+diff --git a/scheduler/src/sink.rs b/scheduler/src/sink.rs
+index a4b0084..bb1a014 100644
+--- a/scheduler/src/sink.rs
++++ b/scheduler/src/sink.rs
+@@ -71,6 +71,22 @@ lazy_static! {
+     static ref DEV_NULL_FD: i32 = open_dev_null();
+ }
+ 
++fn install_idle_stdin() {
++    let mut pipe_fds = [0; 2];
++    let ret = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
++    if ret != 0 {
++        panic!("Failed to create idle stdin pipe");
++    }
++
++    unsafe {
++        libc::dup2(pipe_fds[0], STDIN_FILENO);
++        libc::close(pipe_fds[0]);
++    }
++
++    // Keep the write end open so stdin stays blocking instead of becoming EOF.
++    let _write_end = pipe_fds[1];
++}
++
+ /// Reserver the fixed fds ids used to communicate with AFL.
+ /// If this is not done and we are allocating too many fds, such that we are ending
+ /// up in the fds id range used by AFL, things get messy if close, dup2, etc. are used on these fds.
+@@ -725,6 +741,11 @@ impl AflSink {
+             InputChannel::Stdin => unsafe {
+                 libc::dup2(self.input_file.0.as_raw_fd(), 0);
+             },
++            InputChannel::Tcp => {
++                // Some network servers (e.g. OpenSSL s_server) treat stdin EOF
++                // as a shutdown signal. Give them a blocking stdin instead.
++                install_idle_stdin();
++            }
+             _ => unsafe {
+                 libc::dup2(*DEV_NULL_FD, STDIN_FILENO);
+             },
+@@ -839,8 +860,19 @@ impl AflSink {
+         }
+ 
+         log::trace!("Waiting for child pid");
+-        AflSink::wait_for_data(&[self.receive_fd.unwrap()], AFL_DEFAULT_TIMEOUT)
+-            .context("Failed to retrive child pid from forkserver")?;
++        if let Err(err) = AflSink::wait_for_data(&[self.receive_fd.unwrap()], AFL_DEFAULT_TIMEOUT)
++        {
++            let forkserver_waitpid_status = self
++                .forkserver_sid
++                .and_then(|sid| try_get_child_exit_reason(sid));
++            log::error!(
++                "Failed to retrieve child pid from forkserver. forkserver_sid={:?}, forkserver_waitpid_status={:?}, poll_error={:#?}",
++                self.forkserver_sid,
++                forkserver_waitpid_status,
++                err
++            );
++            return Err(err).context("Failed to retrive child pid from forkserver");
++        }
+         let ret = unsafe { libc::read(self.receive_fd.unwrap(), buf_ptr, 4) };
+         if ret != 4 {
+             error!("Failed to retrive child pid");
+@@ -993,6 +1025,12 @@ impl AflSink {
+ 
+         let child_msg = i32::from_le_bytes(buffer);
+         log::trace!("Child send exit message {}", child_msg);
++        log::debug!(
++            "Child raw exit message: dec={} hex=0x{:08x} bytes={:02x?}",
++            child_msg,
++            child_msg as u32,
++            buffer
++        );
+ 
+         if libc::WIFEXITED(child_msg) {
+             self.child_pid.take();
+diff --git a/scheduler/src/source.rs b/scheduler/src/source.rs
+index 549ac57..546e48e 100644
+--- a/scheduler/src/source.rs
++++ b/scheduler/src/source.rs
+@@ -1,6 +1,6 @@
+ #![allow(clippy::type_complexity)]
+ 
+-use byte_unit::{n_mib_bytes};
++use byte_unit::n_mib_bytes;
+ use fuzztruction_shared::{
+     aux_messages::{AuxStreamMessage, AuxStreamType},
+     aux_stream::AuxStreamAssembler,
+@@ -67,6 +67,219 @@ const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(120);
+ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+ const MAX_OUTPUT_SIZE: u64 = n_mib_bytes!(1) as u64;
+ 
++fn parse_reuid_from_status(status: &str) -> Option<u32> {
++    for line in status.lines() {
++        if let Some(rest) = line.strip_prefix("Uid:") {
++            return rest.split_whitespace().next()?.parse::<u32>().ok();
++        }
++    }
++    None
++}
++
++fn current_max_fd_number() -> Option<i32> {
++    let mut max_fd: Option<i32> = None;
++    let entries = fs::read_dir("/proc/self/fd").ok()?;
++    for entry in entries.flatten() {
++        let name = entry.file_name();
++        let fd = name.to_string_lossy().parse::<i32>().ok();
++        if let Some(fd) = fd {
++            max_fd = Some(max_fd.map_or(fd, |cur| cur.max(fd)));
++        }
++    }
++    max_fd
++}
++
++fn mq_usage_bytes_in_current_ns() -> Option<(usize, u64)> {
++    let mut queue_count = 0usize;
++    let mut qsize_sum = 0u64;
++    let entries = fs::read_dir("/dev/mqueue").ok()?;
++    for entry in entries.flatten() {
++        let path = entry.path();
++        let content = fs::read_to_string(&path).ok()?;
++        // Format usually contains "QSIZE:<n>"
++        if let Some(idx) = content.find("QSIZE:") {
++            let tail = &content[idx + "QSIZE:".len()..];
++            let num = tail
++                .chars()
++                .take_while(|c| c.is_ascii_digit())
++                .collect::<String>()
++                .parse::<u64>()
++                .ok()?;
++            qsize_sum += num;
++            queue_count += 1;
++        }
++    }
++    Some((queue_count, qsize_sum))
++}
++
++fn uid_ipc_namespace_distribution(reuid: u32) -> Option<Vec<(String, usize)>> {
++    let mut ns_count: HashMap<String, usize> = HashMap::new();
++    let proc_entries = fs::read_dir("/proc").ok()?;
++    for proc_entry in proc_entries.flatten() {
++        let pid = proc_entry.file_name();
++        if pid.to_string_lossy().parse::<u32>().is_err() {
++            continue;
++        }
++        let status_path = proc_entry.path().join("status");
++        let status = match fs::read_to_string(status_path) {
++            Ok(s) => s,
++            Err(_) => continue,
++        };
++        if parse_reuid_from_status(&status) != Some(reuid) {
++            continue;
++        }
++        let ipc_ns_path = proc_entry.path().join("ns/ipc");
++        let ipc_ns = match fs::read_link(ipc_ns_path) {
++            Ok(ns) => ns.to_string_lossy().into_owned(),
++            Err(_) => continue,
++        };
++        *ns_count.entry(ipc_ns).or_insert(0) += 1;
++    }
++    let mut dist: Vec<(String, usize)> = ns_count.into_iter().collect();
++    dist.sort_by(|a, b| b.1.cmp(&a.1));
++    Some(dist)
++}
++
++fn log_mqueue_mount_status(phase: &str) {
++    let mounts = match fs::read_to_string("/proc/self/mounts") {
++        Ok(m) => m,
++        Err(err) => {
++            log::warn!("{}: failed to read /proc/self/mounts: {}", phase, err);
++            return;
++        }
++    };
++
++    let mut found = false;
++    for line in mounts.lines() {
++        let mut parts = line.split_whitespace();
++        let _src = parts.next();
++        let mount_point = parts.next();
++        let fs_type = parts.next();
++        let options = parts.next();
++        if mount_point == Some("/dev/mqueue") {
++            found = true;
++            log::info!(
++                "{}: /dev/mqueue mount found, fs_type={}, options={}",
++                phase,
++                fs_type.unwrap_or("<unknown>"),
++                options.unwrap_or("<unknown>")
++            );
++            break;
++        }
++    }
++    if !found {
++        log::warn!("{}: /dev/mqueue is NOT mounted", phase);
++    }
++}
++
++fn log_mq_runtime_diagnostics(phase: &str) {
++    log_mqueue_mount_status(phase);
++
++    let mut nofile_limit = libc::rlimit {
++        rlim_cur: 0,
++        rlim_max: 0,
++    };
++    // SAFETY: getrlimit only writes to the provided struct.
++    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut nofile_limit) } == 0 {
++        log::info!(
++            "{}: RLIMIT_NOFILE soft={} hard={}",
++            phase,
++            nofile_limit.rlim_cur,
++            nofile_limit.rlim_max
++        );
++    } else {
++        log::warn!("{}: failed to read RLIMIT_NOFILE", phase);
++    }
++
++    let mut msgq_limit = libc::rlimit {
++        rlim_cur: 0,
++        rlim_max: 0,
++    };
++    // SAFETY: getrlimit only writes to the provided struct.
++    if unsafe { libc::getrlimit(libc::RLIMIT_MSGQUEUE, &mut msgq_limit) } == 0 {
++        log::info!(
++            "{}: RLIMIT_MSGQUEUE soft={} hard={}",
++            phase,
++            msgq_limit.rlim_cur,
++            msgq_limit.rlim_max
++        );
++    } else {
++        log::warn!("{}: failed to read RLIMIT_MSGQUEUE", phase);
++    }
++
++    match fs::read_dir("/proc/self/fd") {
++        Ok(entries) => {
++            let fd_count = entries.count();
++            let max_fd_number = current_max_fd_number().unwrap_or(-1);
++            log::info!(
++                "{}: open_fd_count={} max_fd_number={}",
++                phase,
++                fd_count,
++                max_fd_number
++            );
++        }
++        Err(err) => {
++            log::warn!("{}: failed to count /proc/self/fd: {}", phase, err);
++        }
++    }
++
++    for key in [
++        "queues_max",
++        "msg_max",
++        "msgsize_max",
++        "msg_default",
++        "msgsize_default",
++    ] {
++        let path = format!("/proc/sys/fs/mqueue/{key}");
++        match fs::read_to_string(&path) {
++            Ok(v) => log::info!("{}: {}={}", phase, key, v.trim()),
++            Err(err) => log::warn!("{}: failed to read {}: {}", phase, path, err),
++        }
++    }
++
++    let reuid = unsafe { libc::getuid() };
++    if let Some((queue_count, qsize_sum)) = mq_usage_bytes_in_current_ns() {
++        log::info!(
++            "{}: mq_usage_current_ns reuid={} queue_count={} qsize_bytes_sum={}",
++            phase,
++            reuid,
++            queue_count,
++            qsize_sum
++        );
++    } else {
++        log::warn!("{}: failed to estimate mq usage in current namespace", phase);
++    }
++
++    if let Some(dist) = uid_ipc_namespace_distribution(reuid) {
++        let namespace_count = dist.len();
++        let summary = dist
++            .iter()
++            .take(5)
++            .map(|(ns, cnt)| format!("{}:{}", ns, cnt))
++            .collect::<Vec<_>>()
++            .join(", ");
++        log::info!(
++            "{}: ipc_namespace_distribution reuid={} namespace_count={} top={}",
++            phase,
++            reuid,
++            namespace_count,
++            summary
++        );
++        if namespace_count > 1 {
++            log::warn!(
++                "{}: detected processes of same reuid in multiple IPC namespaces",
++                phase
++            );
++        }
++    } else {
++        log::warn!(
++            "{}: failed to inspect IPC namespace distribution for reuid={}",
++            phase,
++            reuid
++        );
++    }
++}
++
+ lazy_static! {
+     /// Mapping of (binary path, Child PID) to patch point collection if they
+     /// have already been parsed once.
+@@ -465,7 +678,8 @@ impl Source {
+                 // This is an own mount in our mount namespace, thus we need
+                 // to explicitly mount it.
+                 jail.bind_rw(&workdir);
+-                jail.no_random_devices();
++
++                // jail.no_random_devices();
+                 Some(jail.build()?)
+             } else {
+                 None
+@@ -565,6 +779,7 @@ impl Source {
+         log::debug!("Starting source");
+ 
+         log::debug!("Creating POSIX queues");
++        log_mq_runtime_diagnostics("Before MQ create");
+         log::debug!("Creating sending MQ: {}", self.mq_send_name);
+         self.mq_send = Some(
+             posixmq::OpenOptions::readwrite()
+@@ -573,6 +788,7 @@ impl Source {
+                 .open(&self.mq_send_name)
+                 .context("Failed to create send MQ")?,
+         );
++        log_mq_runtime_diagnostics("After send MQ create");
+ 
+         log::debug!("Creating receiving MQ: {}", self.mq_recv_name);
+         self.mq_recv = Some(
+@@ -582,6 +798,7 @@ impl Source {
+                 .open(&self.mq_recv_name)
+                 .context("Failed to create recv MQ")?,
+         );
++        log_mq_runtime_diagnostics("After recv MQ create");
+ 
+         let child_pid;
+         unsafe {
+@@ -740,8 +957,24 @@ impl Source {
+                     assert_eq!(ret, 0);
+ 
+                     // Disable ASLR since we rely on all instances having the same memory layout.
+-                    let ret = libc::personality(libc::ADDR_NO_RANDOMIZE as u64);
+-                    assert_eq!(ret, 0);
++                    let _ = libc::personality(libc::ADDR_NO_RANDOMIZE as u64);
++                    let check_personality = libc::personality(0xffffffff);
++                    if check_personality & libc::ADDR_NO_RANDOMIZE == 0 {
++                        let err = std::io::Error::last_os_error();
++                        let errno = err.raw_os_error().unwrap_or(0);
++                        match errno {
++                            libc::EINVAL => {
++                                log::error!("Invalid argument");
++                            }
++                            libc::EPERM => {
++                                log::error!("Operation not permitted");
++                            }
++                            _ => {
++                                log::error!("Unknown error: {}", errno);
++                            }
++                        }
++                        panic!("Failed to disable ASLR");
++                    }
+ 
+                     if let Some(ref mut jail) = self.jail {
+                         // ! Make sure that the code in `enter()` is async-signal-safe since we
+@@ -1494,8 +1727,20 @@ impl Source {
+                     } else {
+                         /* Signals are represented by negative exit codes */
+                         log::trace!("Child was signalled");
++                        let signal = match Signal::try_from(libc::WTERMSIG(-exit_code)) {
++                            Ok(signal) => signal,
++                            Err(err) => {
++                                log::error!(
++                                    "Failed to convert exit code to signal: {:?}, exit_code is {}",
++                                    err,
++                                    exit_code
++                                );
++                                log::error!("Use the SIGUSR1 to substitute the signal value {}, temporary workaround until we understand the signal conversion better", -exit_code);
++                                Signal::SIGUSR1
++                            }
++                        };
+                         return Ok((RunResult::Signalled {
+-                            signal: Signal::try_from(libc::WTERMSIG(-exit_code)).unwrap(),
++                            signal,
+                             msgs: self.msg_buffer.take().unwrap(),
+                         })
+                         .into());
+@@ -2053,6 +2298,16 @@ fn kill_child_process_group(pid_msg: &ChildPid) -> Result<()> {
+     Ok(())
+ }
+ 
++fn send_sig_to_child(pid_msg: &ChildPid, sig: Signal) -> Result<()> {
++    let pid = nix::unistd::Pid::from_raw(pid_msg.pid.try_into().unwrap());
++    let ret = nix::sys::signal::kill(pid, sig);
++    if let Err(err) = ret {
++        log::trace!("Failed to send signal to child {pid:?}. However, this might just indicate that the child won the race and terminated itself. err={:#?}", err);
++        return Err(err.into());
++    }
++    Ok(())
++}
++
+ /// Check that some constraints hold for the patch points:
+ ///     - VMAs are unique
+ ///     - PatchPointIDs are unique
