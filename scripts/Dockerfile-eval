@@ -1,0 +1,53 @@
+FROM ubuntu:24.04
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG http_proxy=$HTTP_PROXY
+ARG https_proxy=$HTTP_PROXY
+ARG ZH_CN
+
+ENV ZH_CN=${ZH_CN}
+
+# Change the Ubuntu package mirror
+RUN apt update && apt install -y apt-transport-https ca-certificates
+RUN if [ "${ZH_CN}" = "true" ]; then \
+        sed -i 's@//.*archive.ubuntu.com@//mirrors.ustc.edu.cn@g' /etc/apt/sources.list.d/ubuntu.sources && \
+        sed -i 's/security.ubuntu.com/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/ubuntu.sources && \
+        apt clean; \
+    fi
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=cache,target=/var/cache/apt --mount=type=cache,target=/var/lib/apt \
+    apt update -y && \
+    apt install -y \
+    build-essential graphviz-dev sudo \
+    python3 python3-pip python3-dev python3-setuptools python-is-python3 \
+    && rm -rf /var/lib/apt/lists
+
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+ENV USER_ID=${USER_ID}
+ENV GROUP_ID=${GROUP_ID}
+
+RUN userdel $(getent passwd ${USER_ID} | cut -d: -f1) || true
+RUN groupdel $(getent group ${GROUP_ID} | cut -d: -f1) || true
+RUN groupadd -g ${GROUP_ID} user && \
+    useradd -u ${USER_ID} -rm -d /home/user -s /usr/bin/zsh -g user -G sudo user -p "$(openssl passwd -1 user)" && \
+    echo "user ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER user
+WORKDIR /home/user
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=bind,source=scripts,target=/root/scripts \
+    if [ "${ZH_CN}" = "true" ]; then \
+        sudo -E pip3 install --break-system-packages -i https://mirrors.aliyun.com/pypi/simple -r /root/scripts/requirements.txt; \
+    else \
+        sudo -E pip3 install --break-system-packages -r /root/scripts/requirements.txt; \
+    fi
+
+RUN jupyter server --generate-config && \
+    echo "c.NotebookApp.token = ''" >> /home/user/.jupyter/jupyter_server_config.py && \
+    echo "c.NotebookApp.disable_check_xsrf = True" >> /home/user/.jupyter/jupyter_server_config.py
+
+ENTRYPOINT ["bash", "-c", "jupyter lab --allow_remote_access=true --ip='*' --port=38888 --notebook-dir=/home/user/profuzzbench"]

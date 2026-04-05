@@ -1,0 +1,607 @@
+#!/usr/bin/env bash
+
+function ensure_local_nettle {
+    local bench_root="${HOME}/profuzzbench"
+    local nettle_prefix="${HOME}/local/nettle"
+    local nettle_repo="${HOME}/.git-cache/gnutls/devel/nettle"
+    local nettle_ref="a2a06312b94f015ff8b061f0567de940338aadb4"
+    local nettle_pc_dir=""
+    local nettle_version_ok=0
+
+    if [ -f "${nettle_prefix}/lib/pkgconfig/nettle.pc" ]; then
+        nettle_pc_dir="${nettle_prefix}/lib/pkgconfig"
+    elif [ -f "${nettle_prefix}/lib64/pkgconfig/nettle.pc" ]; then
+        nettle_pc_dir="${nettle_prefix}/lib64/pkgconfig"
+    fi
+
+    if [ ! -d "${nettle_repo}" ]; then
+        nettle_repo="${bench_root}/repo/gnutls/devel/nettle"
+    fi
+
+    if [ -n "${nettle_pc_dir}" ]; then
+        if PKG_CONFIG_PATH="${nettle_pc_dir}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}" \
+            pkg-config --atleast-version=3.10 nettle; then
+            nettle_version_ok=1
+        fi
+    fi
+
+    if [ "${nettle_version_ok}" -eq 1 ]; then
+        export PKG_CONFIG_PATH="${nettle_pc_dir}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+        export LD_LIBRARY_PATH="$(dirname "${nettle_pc_dir}")${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        return 0
+    fi
+
+    git config --global --add safe.directory "${nettle_repo}" || return 1
+
+    pushd "${nettle_repo}" >/dev/null || return 1
+    git fetch --all --tags --prune || return 1
+    git checkout "${nettle_ref}" || return 1
+    sh .bootstrap || return 1
+    rm -rf "${nettle_prefix}"
+    ./configure --prefix="${nettle_prefix}" --disable-documentation || return 1
+    make -j ${MAKE_OPT} || return 1
+    make install || return 1
+    popd >/dev/null || return 1
+
+    if [ -f "${nettle_prefix}/lib/pkgconfig/nettle.pc" ]; then
+        nettle_pc_dir="${nettle_prefix}/lib/pkgconfig"
+    else
+        nettle_pc_dir="${nettle_prefix}/lib64/pkgconfig"
+    fi
+
+    export PKG_CONFIG_PATH="${nettle_pc_dir}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+    export LD_LIBRARY_PATH="$(dirname "${nettle_pc_dir}")${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+}
+
+function prepare_gnutls_configure {
+    if [ -f ./bootstrap.conf ]; then
+        sed -i 's|^required_submodules=.*$|required_submodules="cligen devel/nettle devel/libtasn1"|' ./bootstrap.conf || return 1
+    fi
+
+    if [ ! -x ./configure ]; then
+        ./bootstrap --skip-po --no-git --gnulib-srcdir=/usr/share/gnulib || return 1
+    fi
+}
+
+function checkout {
+    target_ref="${1:-868ed4b}"
+
+    if [ ! -d ".git-cache/gnutls" ]; then
+        git clone https://github.com/gnutls/gnutls .git-cache/gnutls || return 1
+    else
+        git -C .git-cache/gnutls fetch --all --tags --prune || return 1
+    fi
+
+    pushd .git-cache/gnutls >/dev/null || return 1
+    git reset --hard HEAD || return 1
+    git clean -fdx || return 1
+    git checkout "${target_ref}" || return 1
+    prepare_gnutls_configure || return 1
+    popd >/dev/null || return 1
+
+    mkdir -p repo
+    rm -rf repo/gnutls
+    cp -r .git-cache/gnutls repo/gnutls || return 1
+    pushd repo/gnutls >/dev/null || return 1
+
+    git apply "${HOME}/profuzzbench/subjects/TLS/GnuTLS/fuzzing.patch" || return 1
+    git add .
+    git -c user.name=example -c user.email=example@example.com commit -m "apply fuzzing patch" || return 1
+    popd >/dev/null
+}
+
+function replay {
+    export LD_LIBRARY_PATH="${HOME}/local/nettle/lib64:${HOME}/local/nettle/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    ${HOME}/aflnet/aflnet-replay $1 TLS 5555 100 &
+    LD_PRELOAD=libgcov_preload.so:libfake_random.so FAKE_RANDOM=1 \
+        timeout -k 1s 3s ./src/gnutls-serv \
+        -a -d 1000 --earlydata \
+        --alpn=http/2 \
+        --x509cafile=${HOME}/profuzzbench/cert/ca.crt \
+        --x509certfile=${HOME}/profuzzbench/cert/server.crt \
+        --x509keyfile=${HOME}/profuzzbench/cert/server.key \
+        -b -p 5555
+    wait
+}
+
+function build_aflnet {
+    mkdir -p ${HOME}/target/aflnet
+    rm -rf ${HOME}/target/aflnet/*
+    cp -r repo/gnutls ${HOME}/target/aflnet/gnutls
+    pushd ${HOME}/target/aflnet/gnutls >/dev/null
+
+    ensure_local_nettle || return 1
+    prepare_gnutls_configure || return 1
+
+    unset FAKETIME
+    export AFL_USE_ASAN=1
+    export ASAN_OPTIONS=detect_leaks=0
+    export CC=${HOME}/aflnet/afl-clang-fast
+    export CXX=${HOME}/aflnet/afl-clang-fast++
+    export CFLAGS="-g -O3 -fsanitize=address -DFT_FUZZING -DFT_CONSUMER"
+    export CXXFLAGS="-g -O3 -fsanitize=address -DFT_FUZZING -DFT_CONSUMER"
+    export LDFLAGS="-fsanitize=address"
+
+    ./configure --enable-heartbeat-support --disable-maintainer-mode --disable-doc --disable-tests --enable-static --enable-shared=no || return 1
+    make -j ${MAKE_OPT} || return 1
+
+    rm -rf .git
+
+    popd >/dev/null
+}
+
+function build_asan {
+    mkdir -p ${HOME}/target/asan
+    rm -rf ${HOME}/target/asan/*
+    cp -r repo/gnutls ${HOME}/target/asan/gnutls
+    pushd ${HOME}/target/asan/gnutls >/dev/null
+
+    ensure_local_nettle || return 1
+    prepare_gnutls_configure || return 1
+
+    unset FAKETIME
+    export ASAN_OPTIONS=detect_leaks=0
+    export CC=clang
+    export CXX=clang++
+    export CFLAGS="-g -O1 -fsanitize=address -fno-omit-frame-pointer -DFT_FUZZING -DFT_CONSUMER"
+    export CXXFLAGS="-g -O1 -fsanitize=address -fno-omit-frame-pointer -DFT_FUZZING -DFT_CONSUMER"
+    export LDFLAGS="-fsanitize=address"
+
+    ./configure --enable-heartbeat-support --disable-maintainer-mode --disable-doc --disable-tests --enable-static --enable-shared=no || return 1
+    make -j ${MAKE_OPT} || return 1
+
+    rm -rf .git
+
+    popd >/dev/null
+}
+
+function run_aflnet {
+    replay_step=$1
+    gcov_step=$2
+    timeout=$3
+    outdir=/tmp/fuzzing-output
+    indir=${HOME}/profuzzbench/subjects/TLS/OpenSSL/in-tls
+
+    pushd ${HOME}/target/aflnet/gnutls >/dev/null
+
+    mkdir -p $outdir
+
+    export AFL_NO_AFFINITY=1
+    export AFL_SKIP_CPUFREQ=1
+    export AFL_PRELOAD=libfake_random.so
+    export FAKE_RANDOM=1
+    export LD_LIBRARY_PATH="${HOME}/local/nettle/lib64:${HOME}/local/nettle/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    export ASAN_OPTIONS="abort_on_error=1:symbolize=1:detect_leaks=0:handle_abort=2:handle_segv=2:handle_sigbus=2:handle_sigill=2:detect_stack_use_after_return=0:detect_odr_violation=0"
+
+    timeout -k 0 --preserve-status $timeout \
+        ${HOME}/aflnet/afl-fuzz -d -i $indir \
+        -o $outdir -N tcp://127.0.0.1/5555 \
+        -P TLS -D 10000 -q 3 -s 3 -E -K -R -W 100 -m none -t 2000 \
+        ./src/gnutls-serv \
+        -a -d 1000 --earlydata \
+        --alpn=http/2 \
+        --x509cafile=${HOME}/profuzzbench/cert/ca.crt \
+        --x509certfile=${HOME}/profuzzbench/cert/server.crt \
+        --x509keyfile=${HOME}/profuzzbench/cert/server.key \
+        -b -p 5555
+
+    cd ${HOME}/target/gcov/consumer/gnutls
+    gcovr -r . -s -d >/dev/null 2>&1
+    list_cmd="ls -1 ${outdir}/replayable-queue/id* | awk 'NR % ${replay_step} == 0' | tr '\n' ' ' | sed 's/ $//'"
+    compute_coverage replay "$list_cmd" ${gcov_step} ${outdir}/coverage.csv ""
+
+    mkdir -p ${outdir}/cov_html
+    gcovr -r . --html --html-details -o ${outdir}/cov_html/index.html
+
+    popd >/dev/null
+}
+
+function build_stateafl {
+    mkdir -p ${HOME}/target/stateafl
+    rm -rf ${HOME}/target/stateafl/*
+    cp -r repo/gnutls ${HOME}/target/stateafl/gnutls
+    pushd ${HOME}/target/stateafl/gnutls >/dev/null
+
+    ensure_local_nettle || return 1
+    prepare_gnutls_configure || return 1
+
+    export CC=$HOME/stateafl/afl-clang-fast
+    export CXX=$HOME/stateafl/afl-clang-fast++
+    export CFLAGS="-g -O3 -fsanitize=address -DFT_FUZZING -DFT_CONSUMER"
+    export CXXFLAGS="-g -O3 -fsanitize=address -DFT_FUZZING -DFT_CONSUMER"
+    export LDFLAGS="-fsanitize=address"
+
+    ./configure --enable-heartbeat-support --disable-maintainer-mode --disable-doc --disable-tests --enable-static --enable-shared=no || return 1
+    make -j ${MAKE_OPT} || return 1
+
+    rm -rf .git
+
+    popd >/dev/null
+}
+
+function run_stateafl {
+    replay_step=$1
+    gcov_step=$2
+    timeout=$3
+    outdir=/tmp/fuzzing-output
+    indir=${HOME}/profuzzbench/subjects/TLS/OpenSSL/in-tls-replay
+    pushd ${HOME}/target/stateafl/gnutls >/dev/null
+
+    mkdir -p $outdir
+
+    export AFL_NO_AFFINITY=1
+    export AFL_SKIP_CPUFREQ=1
+    export AFL_PRELOAD=libfake_random.so
+    export FAKE_RANDOM=1
+    export LD_LIBRARY_PATH="${HOME}/local/nettle/lib64:${HOME}/local/nettle/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    export ASAN_OPTIONS="abort_on_error=1:symbolize=1:detect_leaks=0:handle_abort=2:handle_segv=2:handle_sigbus=2:handle_sigill=2:detect_stack_use_after_return=0:detect_odr_violation=0"
+
+    timeout -k 0 --preserve-status $timeout \
+        $HOME/stateafl/afl-fuzz -d -i $indir \
+        -o $outdir -N tcp://127.0.0.1/5555 \
+        -P TLS -D 10000 -q 3 -s 3 -E -K -R -W 100 -m none \
+        ./src/gnutls-serv \
+        -a -d 1000 --earlydata \
+        --alpn=http/2 \
+        --x509cafile=${HOME}/profuzzbench/cert/ca.crt \
+        --x509certfile=${HOME}/profuzzbench/cert/server.crt \
+        --x509keyfile=${HOME}/profuzzbench/cert/server.key \
+        -b -p 5555
+    
+    cd ${HOME}/target/gcov/consumer/gnutls
+    list_cmd="ls -1 ${outdir}/replayable-queue/id* | awk 'NR % ${replay_step} == 0' | tr '\n' ' ' | sed 's/ $//'"
+    # clean_cmd="rm -f ${HOME}/target/gcov/consumer/gnutls/build/bin/ACME_STORE/*"
+    # compute_coverage replay "$list_cmd" ${gcov_step} ${outdir}/coverage.csv "" "$clean_cmd"
+
+    compute_coverage replay "$list_cmd" ${gcov_step} ${outdir}/coverage.csv ""
+
+    mkdir -p ${outdir}/cov_html
+    gcovr -r . --html --html-details -o ${outdir}/cov_html/index.html
+
+    popd >/dev/null
+}
+
+
+function build_sgfuzz {
+    mkdir -p ${HOME}/target/sgfuzz
+    rm -rf ${HOME}/target/sgfuzz/*
+    cp -r repo/gnutls ${HOME}/target/sgfuzz/gnutls
+    pushd ${HOME}/target/sgfuzz/gnutls >/dev/null
+
+    ensure_local_nettle || return 1
+    prepare_gnutls_configure || return 1
+
+    export LLVM_COMPILER=clang
+    export CC=wllvm
+    export CXX=wllvm++
+    export CFLAGS="-O0 -g -fno-inline-functions -fno-inline -fno-discard-value-names -fno-vectorize -fno-slp-vectorize -DFT_FUZZING -DFT_CONSUMER -DSGFUZZ -v -Wno-int-conversion"
+    export CXXFLAGS="-O0 -g -fno-inline-functions -fno-inline -fno-discard-value-names -fno-vectorize -fno-slp-vectorize -DFT_FUZZING -DFT_CONSUMER -DSGFUZZ -v -Wno-int-conversion"
+
+    python3 $HOME/sgfuzz/sanitizer/State_machine_instrument.py .
+
+    ./configure --enable-heartbeat-support --disable-maintainer-mode --enable-static --enable-shared=no --disable-tests --disable-doc --disable-fips140 || return 1
+    make ${MAKE_OPT} || return 1
+
+    pushd src >/dev/null
+    extract-bc gnutls-serv
+
+    export SGFUZZ_USE_HF_MAIN=1
+    export SGFUZZ_PATCHING_TYPE_FILE=${HOME}/target/sgfuzz/gnutls/enum_types.txt
+    opt -load-pass-plugin=${HOME}/sgfuzz-llvm-pass/sgfuzz-source-pass.so \
+        -passes="sgfuzz-source" -debug-pass-manager gnutls-serv.bc -o gnutls-serv_opt.bc
+
+    llvm-dis-17 gnutls-serv_opt.bc -o gnutls-serv_opt.ll
+    sed -i 's/optnone //g' gnutls-serv_opt.ll
+
+    clang gnutls-serv_opt.ll -o gnutls-serv \
+        -Wl,--no-whole-archive ../lib/.libs/libgnutls.a \
+        -lsFuzzer -lhfnetdriver -lhfcommon -lstdc++ \
+        -fsanitize=address -fsanitize=fuzzer \
+        -lzstd -lz -lp11-kit -lidn2 -lunistring -ldl -ltasn1 -lnettle -lhogweed -lgmp -lpthread -lrt -lm -ldl -lresolv -lc -lgcc -lgcc_s 
+
+    popd >/dev/null
+    rm -rf .git
+
+    popd >/dev/null
+}
+
+function run_sgfuzz {
+    replay_step=$1
+    gcov_step=$2
+    timeout=$3
+    outdir=/tmp/fuzzing-output
+    queue=${outdir}/replayable-queue
+    indir=${HOME}/profuzzbench/subjects/TLS/OpenSSL/in-tls
+
+    pushd ${HOME}/target/sgfuzz/gnutls/src >/dev/null
+
+    mkdir -p $queue
+    rm -rf $queue/*
+    mkdir -p ${outdir}/crash
+    rm -rf ${outdir}/crash/*
+
+    export AFL_SKIP_CPUFREQ=1
+    export AFL_PRELOAD=libfake_random.so
+    export FAKE_RANDOM=1
+    export LD_LIBRARY_PATH="${HOME}/local/nettle/lib64:${HOME}/local/nettle/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    export ASAN_OPTIONS="abort_on_error=1:symbolize=1:detect_leaks=0:handle_abort=2:handle_segv=2:handle_sigbus=2:handle_sigill=2:detect_stack_use_after_return=1:detect_odr_violation=0:detect_container_overflow=0:poison_array_cookie=0"
+    export HFND_TCP_PORT=5555
+    export HFND_FORK_MODE=1
+
+    SGFuzz_ARGS=(
+        -max_len=100000
+        -close_fd_mask=3
+        -shrink=1
+        -reduce_inputs=1
+        -reload=30
+        -fork=1
+        -print_full_coverage=1
+        -print_final_stats=1
+        -detect_leaks=0
+        -max_total_time=$timeout
+        -artifact_prefix="${outdir}/crashes/"
+        "${queue}"
+        "${indir}"
+    )
+
+    GNUTLS_ARGS=(
+        -a
+        -d 1000
+        --earlydata
+        --alpn=http/2
+        --ocsp-response=${HOME}/profuzzbench/cert/ocsp.der
+        --x509cafile=${HOME}/profuzzbench/cert/ca.crt
+        --x509certfile=${HOME}/profuzzbench/cert/server.crt
+        --x509keyfile=${HOME}/profuzzbench/cert/server.key
+        -b
+        -p 5555
+    )
+
+    ./gnutls-serv "${SGFuzz_ARGS[@]}" -- "${GNUTLS_ARGS[@]}"
+
+    python3 ${HOME}/profuzzbench/scripts/sort_libfuzzer_findings.py ${queue}
+
+    list_cmd="ls -1 ${queue}/id* | awk 'NR % ${replay_step} == 0' | tr '\n' ' ' | sed 's/ $//'"
+    cd ${HOME}/target/gcov/consumer/gnutls
+
+    function replay {
+        export LD_LIBRARY_PATH="${HOME}/local/nettle/lib64:${HOME}/local/nettle/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        ${HOME}/aflnet/afl-replay $1 TLS 5555 100 &
+        LD_PRELOAD=libgcov_preload.so:libfake_random.so FAKE_RANDOM=1 \
+            timeout -k 1s 3s ./src/gnutls-serv \
+            -a -d 1000 --earlydata \
+            --alpn=http/2 \
+            --x509cafile=${HOME}/profuzzbench/cert/ca.crt \
+            --x509certfile=${HOME}/profuzzbench/cert/server.crt \
+            --x509keyfile=${HOME}/profuzzbench/test.key.pem \
+            -b -p 5555
+        wait
+    }
+
+    gcovr -r . -s -d >/dev/null 2>&1
+    compute_coverage replay "$list_cmd" ${gcov_step} ${outdir}/coverage.csv ""
+
+    mkdir -p ${outdir}/cov_html
+    gcovr -r . --html --html-details -o ${outdir}/cov_html/index.html
+
+    popd >/dev/null
+}
+
+function build_ft_generator {
+    mkdir -p ${HOME}/target/ft/generator
+    rm -rf ${HOME}/target/ft/generator/*
+    cp -r repo/gnutls ${HOME}/target/ft/generator/gnutls
+    pushd ${HOME}/target/ft/generator/gnutls >/dev/null
+
+    ensure_local_nettle || return 1
+    prepare_gnutls_configure || return 1
+
+    export FT_CALL_INJECTION=1
+    export FT_HOOK_INS=branch,load,store,select,switch
+    export CC=${HOME}/fuzztruction-net/generator/pass/fuzztruction-source-clang-fast
+    export CXX=${HOME}/fuzztruction-net/generator/pass/fuzztruction-source-clang-fast++
+    export CFLAGS="-g -O3 -DNDEBUG -DFT_FUZZING -DFT_GENERATOR"
+    export CXXFLAGS="-g -O3 -DNDEBUG -DFT_FUZZING -DFT_GENERATOR"
+    export GENERATOR_AGENT_SO_DIR="${HOME}/fuzztruction-net/target/release/"
+    export LLVM_PASS_SO="${HOME}/fuzztruction-net/generator/pass/fuzztruction-source-llvm-pass.so"
+    export LD_LIBRARY_PATH="${HOME}/fuzztruction-net/target/release:${HOME}/local/nettle/lib64:${HOME}/local/nettle/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+    ./configure --enable-heartbeat-support --disable-maintainer-mode --disable-tests --disable-doc --disable-shared || return 1
+    make ${MAKE_OPT} || return 1
+
+    rm -rf .git
+
+    popd >/dev/null
+}
+
+function build_ft_consumer {
+    sudo cp ${HOME}/profuzzbench/scripts/ld.so.conf/ft-net.conf /etc/ld.so.conf.d/
+    sudo ldconfig
+
+    mkdir -p ${HOME}/target/ft/consumer
+    rm -rf ${HOME}/target/ft/consumer/*
+    cp -r repo/gnutls ${HOME}/target/ft/consumer/gnutls
+    pushd ${HOME}/target/ft/consumer/gnutls >/dev/null
+
+    ensure_local_nettle || return 1
+    prepare_gnutls_configure || return 1
+
+    export AFL_PATH=${HOME}/fuzztruction-net/consumer/aflpp-consumer
+    export CC=${AFL_PATH}/afl-clang-fast
+    export CXX=${AFL_PATH}/afl-clang-fast++
+    export CFLAGS="-O3 -g -fsanitize=address -DFT_FUZZING -DFT_CONSUMER"
+    export CXXFLAGS="-O3 -g -fsanitize=address -DFT_FUZZING -DFT_CONSUMER"
+
+    ./configure --enable-heartbeat-support --disable-maintainer-mode --disable-tests --disable-doc --disable-shared || return 1
+    make ${MAKE_OPT} || return 1
+
+    rm -rf .git
+
+    popd >/dev/null
+}
+
+function run_ft {
+    replay_step=$1
+    gcov_step=$2
+    timeout=$3
+    consumer="GnuTLS"
+    generator=${GENERATOR:-$consumer}
+    ts=$(date +%s)
+    work_dir=/tmp/fuzzing-output
+    pushd ${HOME}/target/ft/ >/dev/null
+
+    # synthesize the ft configuration yaml
+    # according to the targeted fuzzer and generated
+    temp_file=$(mktemp)
+    sed -e "s|WORK-DIRECTORY|${work_dir}|g" -e "s|UID|$(id -u)|g" -e "s|GID|$(id -g)|g" ${HOME}/profuzzbench/ft-common.yaml >"$temp_file"
+    cat "$temp_file" >ft-gnutls.yaml
+    printf "\n" >>ft-gnutls.yaml
+    rm "$temp_file"
+    cat ${HOME}/profuzzbench/subjects/TLS/${generator}/ft-source.yaml >>ft-gnutls.yaml
+    printf "\n" >>ft-gnutls.yaml
+    cat ${HOME}/profuzzbench/subjects/TLS/${consumer}/ft-sink.yaml >>ft-gnutls.yaml
+
+    # running ft-net
+    sudo ${HOME}/fuzztruction-net/target/release/fuzztruction \
+        --purge ft-gnutls.yaml fuzz \
+        -t ${timeout}s
+
+    # collecting coverage results
+    sudo ${HOME}/fuzztruction-net/target/release/fuzztruction ft-gnutls.yaml gcov \
+        -t 3s --delete \
+        --replay-step ${replay_step} --gcov-step ${gcov_step}
+    sudo chmod -R 755 $work_dir
+    sudo chown -R $(id -u):$(id -g) $work_dir
+    cd ${HOME}/target/gcov/consumer/gnutls
+    gcovr -r . --html --html-details -o index.html
+    mkdir -p ${work_dir}/cov_html
+    cp *.html ${work_dir}/cov_html
+
+    popd >/dev/null
+}
+
+function build_pingu_generator {
+    mkdir -p ${HOME}/target/pingu/generator
+    rm -rf ${HOME}/target/pingu/generator/*
+    cp -r repo/gnutls ${HOME}/target/pingu/generator/gnutls
+    pushd ${HOME}/target/pingu/generator/gnutls >/dev/null
+
+    ensure_local_nettle || return 1
+    prepare_gnutls_configure || return 1
+
+    export FT_HOOK_INS=load,store
+    export CC=${HOME}/pingu/fuzztruction/generator/pass/fuzztruction-source-clang-fast
+    export CXX=${HOME}/pingu/fuzztruction/generator/pass/fuzztruction-source-clang-fast++
+    export CFLAGS="-O3 -g -DFT_FUZZING -DFT_GENERATOR"
+    export CXXFLAGS="-O3 -g -DFT_FUZZING -DFT_GENERATOR"
+    export GENERATOR_AGENT_SO_DIR="${HOME}/pingu/fuzztruction/target/debug/"
+    export LLVM_PASS_SO="${HOME}/pingu/fuzztruction/generator/pass/fuzztruction-source-llvm-pass.so"
+    export LD_LIBRARY_PATH="${HOME}/pingu/fuzztruction/target/debug:${HOME}/local/nettle/lib64:${HOME}/local/nettle/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+    ./configure --enable-heartbeat-support --disable-maintainer-mode --disable-tests --disable-doc --disable-shared || return 1
+    rm -f compile_commands.json
+    bear --output compile_commands.json -- make -j ${MAKE_OPT} src/gnutls-cli || return 1
+
+    rm -rf .git
+    popd >/dev/null
+}
+
+function build_pingu_consumer {
+    sudo cp ${HOME}/profuzzbench/scripts/ld.so.conf/pingu.conf /etc/ld.so.conf.d/
+    sudo ldconfig
+
+    mkdir -p ${HOME}/target/pingu/consumer
+    rm -rf ${HOME}/target/pingu/consumer/*
+    cp -r repo/gnutls ${HOME}/target/pingu/consumer/gnutls
+    pushd ${HOME}/target/pingu/consumer/gnutls >/dev/null
+
+    ensure_local_nettle || return 1
+    prepare_gnutls_configure || return 1
+
+    export CC="${HOME}/pingu/target/debug/libafl_cc"
+    export CXX="${HOME}/pingu/target/debug/libafl_cxx"
+    export CFLAGS="-O3 -g -fsanitize=address -DFT_FUZZING -DFT_CONSUMER"
+    export CXXFLAGS="-O3 -g -fsanitize=address -DFT_FUZZING -DFT_CONSUMER"
+    export LDFLAGS="-fsanitize=address"
+
+    ./configure --enable-heartbeat-support --disable-maintainer-mode --disable-tests --disable-doc --disable-shared || return 1
+    rm -f compile_commands.json
+    bear --output compile_commands.json -- make -j ${MAKE_OPT} src/gnutls-serv || return 1
+
+    rm -rf .git
+
+    popd >/dev/null
+}
+
+function run_pingu {
+    local replay_step="${1:-1}"
+    local gcov_step="${2:-1}"
+    local timeout="${3:-300}"
+    local consumer="GnuTLS"
+    local work_dir=/tmp/fuzzing-output
+    local pingu_bin=${HOME}/pingu/target/release/pingu
+
+    if ! [[ "${replay_step}" =~ ^[0-9]+$ ]] || ! [[ "${gcov_step}" =~ ^[0-9]+$ ]] || ! [[ "${timeout}" =~ ^[0-9]+$ ]]; then
+        echo "[!] run_pingu expects: replay_step gcov_step timeout"
+        return 1
+    fi
+    if [ ! -x "${pingu_bin}" ]; then
+        echo "[!] Missing pingu binary: ${pingu_bin}"
+        return 1
+    fi
+
+    pushd ${HOME}/target/pingu/ >/dev/null
+
+    local pingu_cfg_template=${HOME}/profuzzbench/subjects/TLS/${consumer}/pingu.yaml
+    if [ ! -f "${pingu_cfg_template}" ]; then
+        echo "[!] Missing merged pingu config: ${pingu_cfg_template}"
+        return 1
+    fi
+    sed -e "s|WORK-DIRECTORY|${work_dir}|g" \
+        -e "s|UID|$(id -u)|g" \
+        -e "s|GID|$(id -g)|g" \
+        "${pingu_cfg_template}" >pingu.yaml
+
+    sudo -E timeout "${timeout}s" "${pingu_bin}" pingu.yaml -vvv --purge fuzz || true
+    sudo -E "${pingu_bin}" pingu.yaml -vvv gcov --purge
+
+    sudo -E chmod -R 755 ${work_dir}
+    sudo -E chown -R $(id -u):$(id -g) ${work_dir}
+    cd ${HOME}/target/gcov/consumer/gnutls
+    mkdir -p ${work_dir}/cov_html
+    gcovr -r . --html --html-details -o ${work_dir}/cov_html/index.html
+
+    popd >/dev/null
+}
+
+function build_gcov {
+    mkdir -p ${HOME}/target/gcov/consumer
+    rm -rf ${HOME}/target/gcov/consumer/*
+    cp -r repo/gnutls ${HOME}/target/gcov/consumer/gnutls
+    pushd ${HOME}/target/gcov/consumer/gnutls >/dev/null
+
+    ensure_local_nettle || return 1
+    prepare_gnutls_configure || return 1
+
+    unset FAKETIME
+    export CFLAGS="${CFLAGS:-} -fprofile-arcs -ftest-coverage"
+    export CXXFLAGS="${CXXFLAGS:-} -fprofile-arcs -ftest-coverage"
+    export LDFLAGS="${LDFLAGS:-} -fprofile-arcs -ftest-coverage"
+
+    ./configure --enable-heartbeat-support --disable-maintainer-mode --enable-code-coverage --disable-tests --disable-doc --disable-shared || return 1
+    make ${MAKE_OPT} || return 1
+
+    rm -rf .git a-conftest.gcno
+
+    popd >/dev/null
+}
+
+function install_dependencies {
+    sudo -E apt update
+    sudo -E apt install -y dash git-core autoconf libtool gettext autopoint lcov gnulib \
+                            nettle-dev libp11-kit-dev libtspi-dev libunistring-dev \
+                            libtasn1-bin libtasn1-6-dev libidn2-0-dev gawk gperf \
+                            libtss2-dev libunbound-dev dns-root-data bison gtk-doc-tools \
+                            libprotobuf-c1 libev4 libev-dev libzstd-dev
+    # sudo apt-get install -y texinfo texlive texlive-plain-generic texlive-extra-utils
+}

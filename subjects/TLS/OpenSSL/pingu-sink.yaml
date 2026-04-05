@@ -1,0 +1,31 @@
+sink:
+  bin-path: "/home/user/target/pingu/consumer/openssl/apps/openssl"
+  arguments:
+    [
+      "s_server",
+      "-key",
+      "/home/user/profuzzbench/cert/server.key",
+      "-cert",
+      "/home/user/profuzzbench/cert/server.crt",
+      "-accept",
+      "4433",
+      "-naccept",
+      "1",
+      "-4"
+    ]
+  env:  
+    - LD_PRELOAD: "libfake_random.so"
+    - FAKE_RANDOM: "1"
+  cwd: "/home/user/target/pingu/consumer/openssl"
+  input-type: socket
+  output-type: stdout
+  log-stdout: true
+  log-stderr: true
+  allow-unstable-sink: true
+
+gcov:
+  bin-path: "/home/user/target/gcov/consumer/openssl/apps/openssl"
+  env:
+    - LD_PRELOAD: "libfake_random.so:libgcov_preload.so"
+    - FAKE_RANDOM: "1"
+  src-dir: "/home/user/target/gcov/consumer/openssl"

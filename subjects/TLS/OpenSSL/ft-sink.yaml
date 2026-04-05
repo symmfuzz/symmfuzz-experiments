@@ -1,0 +1,42 @@
+sink:
+  bin-path: "/home/user/target/ft/consumer/openssl/apps/openssl"
+  arguments:
+    [
+      "s_server",
+      "-tls1_3",
+      "-key",
+      "/home/user/profuzzbench/cert/server.key",
+      "-cert",
+      "/home/user/profuzzbench/cert/server.crt",
+      "-CAfile",
+      "/home/user/profuzzbench/cert/ca.crt",
+      "-ech_key",
+      "/home/user/profuzzbench/cert/echconfig.pem",
+      "-alpn",
+      "h2,http/1.1",
+      "-status",
+      "-status_file",
+      "/home/user/profuzzbench/cert/ocsp.der",
+      "-num_tickets",
+      "4",
+      "-accept",
+      "4433",
+      "-naccept",
+      "1",
+      "-4"
+    ]
+  input-type: Tcp
+  output-type: Tcp
+  is-server: true
+  server-port: "4433"
+  log-stdout: true
+  log-stderr: true
+  allow-unstable-sink: false
+
+gcov:
+  bin-path: "/home/user/target/gcov/consumer/openssl/apps/openssl"
+  env:
+    - LD_PRELOAD: "libgcov_preload.so"
+  cwd: "/home/user/target/gcov/consumer/openssl"
+  src-dir: "/home/user/target/gcov/consumer/openssl"
+  reporter: gcovr

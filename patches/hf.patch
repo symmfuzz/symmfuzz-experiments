@@ -1,0 +1,372 @@
+diff --git a/libhfnetdriver/netdriver.c b/libhfnetdriver/netdriver.c
+--- a/libhfnetdriver/netdriver.c
++++ b/libhfnetdriver/netdriver.c
+@@ -2,9 +2,12 @@
+ 
+ #include <arpa/inet.h>
+ #include <errno.h>
++#include <fcntl.h>
+ #include <inttypes.h>
++#include <libgen.h>
+ #include <netinet/in.h>
+ #include <netinet/tcp.h>
++#include <poll.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -32,9 +35,16 @@
+ __attribute__((visibility("default"))) __attribute__((used))
+ const char *const LIBHFNETDRIVER_module_netdriver = _HF_NETDRIVER_SIG;
+ 
+-#define HFND_TCP_PORT_ENV     "HFND_TCP_PORT"
+-#define HFND_SOCK_PATH_ENV    "HFND_SOCK_PATH"
+-#define HFND_SKIP_FUZZING_ENV "HFND_SKIP_FUZZING"
++#define HFND_TCP_PORT_ENV        "HFND_TCP_PORT"
++#define HFND_SOCK_PATH_ENV       "HFND_SOCK_PATH"
++#define HFND_SKIP_FUZZING_ENV    "HFND_SKIP_FUZZING"
++#define HFND_FORK_MODE_ENV       "HFND_FORK_MODE"
++#define HFND_FORK_MODE_ARGS_ENV  "HFND_FORK_MODE_ARGS"
++#define HFND_FORK_MODE_CHILD_ENV "HFND_FORK_MODE_CHILD"
++#define HFND_STATE_DUMP_FILES_ENV "HFND_STATE_DUMP_FILES"
++#define HFND_STATE_DUMP_DIR_ENV   "HFND_STATE_DUMP_DIR"
++#define HFND_TESTCASE_BUDGET_MS_ENV "HFND_TESTCASE_BUDGET_MS"
++#define HFND_TESTCASE_BUDGET_MS_DEFAULT 50U
+ 
+ /* Define this to use receiving timeouts
+ #define HFND_RECVTIME 10
+@@ -60,9 +70,34 @@
+         },
+ };
+ 
++static uint32_t hfnd_testcase_budget_ms = HFND_TESTCASE_BUDGET_MS_DEFAULT;
++
++static uint64_t netDriver_nowMonotonicMs(void) {
++    struct timespec ts = {};
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1) {
++        PLOG_F("clock_gettime(CLOCK_MONOTONIC)");
++    }
++    return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
++}
++
+ extern int HonggfuzzNetDriver_main(int argc, char **argv);
+ 
+ static void *netDriver_mainProgram(void *unused HF_ATTR_UNUSED) {
++    if (getenv(HFND_FORK_MODE_ENV) && getenv(HFND_FORK_MODE_CHILD_ENV)) {
++        // Fork mode is enabled, and we are in the child process
++        // Get the server arguments from the environment variable
++        char *cmd = getenv(HFND_FORK_MODE_ARGS_ENV);
++        LOG_I("HFND_FORK_MODE_ARGS_ENV = %s", cmd);
++        char *argv_copy[128];
++        int   argc_copy = 0;
++        char *token     = strtok(cmd, " ");
++        while (token != NULL && argc_copy < 128) {
++            argv_copy[argc_copy++] = token;
++            token                  = strtok(NULL, " ");
++        }
++        hfnd_globals.argc_server = argc_copy;
++        hfnd_globals.argv_server = argv_copy;
++    }
+     int ret = HonggfuzzNetDriver_main(hfnd_globals.argc_server, hfnd_globals.argv_server);
+     LOG_I("Honggfuzz Net Driver (pid=%d): HonggfuzzNetDriver_main() function exited with: %d",
+         (int)getpid(), ret);
+@@ -174,7 +209,7 @@
+ #endif /* defined(SOL_TCP) && defined(TCP_QUICKACK) */
+     }
+ 
+-    netDriver_bindToRndLoopback(sock, addr->sa_family);
++    // netDriver_bindToRndLoopback(sock, addr->sa_family);
+ 
+     LOG_D("Connecting to '%s'", files_sockAddrToStr(addr, socklen));
+     if (TEMP_FAILURE_RETRY(connect(sock, addr, socklen)) == -1) {
+@@ -225,6 +260,18 @@
+             argv[i]      = argv[0];
+             *server_argc = argc - i;
+             *server_argv = &argv[i];
++            if (getenv(HFND_FORK_MODE_ENV) && !getenv(HFND_FORK_MODE_CHILD_ENV)) {
++                // Fork mode is enabled, and we are not in the child process
++                // Combine argv[0] and args after -- into a command string
++                char cmd[4096] = {0};
++                strcat(cmd, argv[0]);
++                for (int j = i + 1; j < argc; j++) {
++                    strcat(cmd, " ");
++                    strcat(cmd, argv[j]);
++                }
++                LOG_I("HFND_FORK_MODE_ARGS_ENV = %s", cmd);
++                setenv(HFND_FORK_MODE_ARGS_ENV, cmd, 1);
++            }
+             return i;
+         }
+     }
+@@ -312,6 +359,137 @@
+     return false;
+ }
+ 
++/*
++ * Copy a file from source to destination
++ * Returns true on success, false on failure
++ */
++static bool netDriver_copyFile(const char *src_path, const char *dst_path) {
++    int src_fd = TEMP_FAILURE_RETRY(open(src_path, O_RDONLY | O_CLOEXEC));
++    if (src_fd == -1) {
++        PLOG_W("Couldn't open source file '%s' for reading", src_path);
++        return false;
++    }
++
++    /* Create destination directory if it doesn't exist */
++    char *dst_path_copy = strdup(dst_path);
++    if (!dst_path_copy) {
++        LOG_W("Couldn't allocate memory for path copy");
++        close(src_fd);
++        return false;
++    }
++    char *dir = dirname(dst_path_copy);
++    if (mkdir(dir, 0755) == -1 && errno != EEXIST) {
++        PLOG_W("Couldn't create destination directory '%s'", dir);
++        free(dst_path_copy);
++        close(src_fd);
++        return false;
++    }
++    free(dst_path_copy);
++
++    int dst_fd = TEMP_FAILURE_RETRY(open(dst_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
++    if (dst_fd == -1) {
++        PLOG_W("Couldn't open destination file '%s' for writing", dst_path);
++        close(src_fd);
++        return false;
++    }
++
++    /* Copy file content in chunks */
++    static char buffer[4096];
++    ssize_t     bytes_read;
++    bool        success = true;
++
++    while ((bytes_read = TEMP_FAILURE_RETRY(read(src_fd, buffer, sizeof(buffer)))) > 0) {
++        ssize_t bytes_written = TEMP_FAILURE_RETRY(write(dst_fd, buffer, bytes_read));
++        if (bytes_written != bytes_read) {
++            PLOG_W("Couldn't write all data to destination file '%s'", dst_path);
++            success = false;
++            break;
++        }
++    }
++
++    if (bytes_read == -1) {
++        PLOG_W("Error reading from source file '%s'", src_path);
++        success = false;
++    }
++
++    close(src_fd);
++    close(dst_fd);
++
++    if (!success) {
++        unlink(dst_path);
++        return false;
++    }
++
++    LOG_I("Successfully backed up '%s' to '%s'", src_path, dst_path);
++    return true;
++}
++
++/*
++ * ASAN error report callback function
++ * This function is called when ASAN detects an error
++ */
++static void netDriver_asanErrorCallback(const char *report HF_ATTR_UNUSED) {
++    const char *files_env = getenv(HFND_STATE_DUMP_FILES_ENV);
++    const char *dir_env   = getenv(HFND_STATE_DUMP_DIR_ENV);
++
++    if (!files_env || !dir_env) {
++        LOG_D("ASAN error callback: Environment variables not set, skipping file backup");
++        return;
++    }
++
++    /* Get current process ID */
++    pid_t pid = getpid();
++
++    /* Create crash directory with pid: crash-{pid} */
++    char crash_dir[PATH_MAX];
++    snprintf(crash_dir, sizeof(crash_dir), "%s/crash-%d", dir_env, (int)pid);
++
++    /* Create the crash directory */
++    if (mkdir(crash_dir, 0755) == -1 && errno != EEXIST) {
++        PLOG_W("Couldn't create crash directory '%s'", crash_dir);
++        return;
++    }
++
++    LOG_I("ASAN error detected (pid=%d), backing up state dump files to '%s'", (int)pid, crash_dir);
++
++    /* Create a copy of the files string for tokenization */
++    char *files_str = strdup(files_env);
++    if (!files_str) {
++        LOG_W("Couldn't allocate memory for files string");
++        return;
++    }
++
++    /* Split files by comma and backup each file */
++    char *token = strtok(files_str, ",");
++    while (token != NULL) {
++        /* Trim whitespace */
++        while (*token == ' ' || *token == '\t') {
++            token++;
++        }
++        char *end = token + strlen(token) - 1;
++        while (end > token && (*end == ' ' || *end == '\t')) {
++            *end = '\0';
++            end--;
++        }
++
++        if (strlen(token) > 0) {
++            /* Construct destination path using basename in crash directory */
++            const char *basename_str = files_basename(token);
++            char        dst_path[PATH_MAX];
++            snprintf(dst_path, sizeof(dst_path), "%s/%s", crash_dir, basename_str);
++
++            /* Backup the file */
++            if (!netDriver_copyFile(token, dst_path)) {
++                LOG_W("Failed to backup file '%s' to '%s'", token, dst_path);
++            }
++        }
++
++        token = strtok(NULL, ",");
++    }
++
++    free(files_str);
++}
++
+ static bool netDriver_checkIfServerReady(int argc, char **argv) {
+     struct sockaddr_storage addr     = {.ss_family = AF_UNSPEC};
+     int                     type     = SOCK_STREAM;
+@@ -384,10 +562,37 @@
+     /* Make sure LIBHFNETDRIVER_module_netdriver (NetDriver signature) is used */
+     LOG_D("Module: %s", LIBHFNETDRIVER_module_netdriver);
+ 
++    /* Register ASAN error report callback if available */
++    __attribute__((weak)) void __asan_set_error_report_callback(void (*callback)(const char *));
++    if (__asan_set_error_report_callback) {
++        __asan_set_error_report_callback(netDriver_asanErrorCallback);
++        LOG_D("Registered ASAN error report callback for state dump file backup");
++    }
++
+     *argc = HonggfuzzNetDriverArgsForServer(
+         *argc, *argv, &hfnd_globals.argc_server, &hfnd_globals.argv_server);
+ 
+-    netDriver_initNsIfNeeded();
++    const char *budget_str = getenv(HFND_TESTCASE_BUDGET_MS_ENV);
++    if (budget_str) {
++        errno                 = 0;
++        unsigned long budgetl = strtoul(budget_str, NULL, 10);
++        if (errno != 0 || budgetl < 1 || budgetl > 600000UL) {
++            LOG_F("Invalid %s='%s' (expected 1..600000 ms)", HFND_TESTCASE_BUDGET_MS_ENV,
++                budget_str);
++        }
++        hfnd_testcase_budget_ms = (uint32_t)budgetl;
++    }
++    LOG_I("Honggfuzz Net Driver (pid=%d): testcase budget set to %" PRIu32 " ms", (int)getpid(),
++        hfnd_testcase_budget_ms);
++
++    if (getenv(HFND_FORK_MODE_ENV) && !getenv(HFND_FORK_MODE_CHILD_ENV)) {
++        // If the fork mode is enabled, and we are not in the child process,
++        // set the FORK_MODE_CHILD_ENV flag to true, leaving it to the child process
++        setenv(HFND_FORK_MODE_CHILD_ENV, "1", 1);
++        return 0;
++    }
++
++    // netDriver_initNsIfNeeded();
+     netDriver_startOriginalProgramInThread();
+     for (;;) {
+         if (netDriver_checkIfServerReady(*argc, *argv)) {
+@@ -429,48 +634,58 @@
+      * Well-behaved TCP servers should process the input and respond/close the TCP connection at
+      * this point
+      */
+-    if (TEMP_FAILURE_RETRY(shutdown(sock, SHUT_WR)) == -1) {
+-        if (errno == ENOTCONN) {
+-            close(sock);
+-            return 0;
++    if (hfnd_globals.dest_addr.type == SOCK_STREAM) {
++        if (TEMP_FAILURE_RETRY(shutdown(sock, SHUT_WR)) == -1) {
++            if (errno == ENOTCONN) {
++                close(sock);
++                return 0;
++            }
++            PLOG_F("shutdown(sock=%d, SHUT_WR)", sock);
+         }
+-        PLOG_F("shutdown(sock=%d, SHUT_WR)", sock);
+     }
+ 
+-#ifdef HFND_RECVTIME
+-    const struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1) {
+-        PLOG_W("Honggfuzz Net Driver (pid=%d): Couldn't set setsockopt(sock=%d, SO_RCVTIMEO, 1s)",
+-            (int)getpid(), sock);
+-    }
+-    time_t start = time(NULL);
+-#endif
+-
+     /*
+      * Try to read data from the server, assuming that an early TCP close would sometimes cause the
+      * TCP server to drop the input data, instead of processing it. Use BSS to avoid putting
+      * pressure on the stack size
+      */
+     static char b[1024ULL * 1024ULL * 4ULL];
++    const uint64_t testcase_start = netDriver_nowMonotonicMs();
+     for (;;) {
+-        int ret = TEMP_FAILURE_RETRY(recv(sock, b, sizeof(b), MSG_WAITALL));
+-        if (ret == 0) {
++        uint64_t elapsed_ms = netDriver_nowMonotonicMs() - testcase_start;
++        if (elapsed_ms >= hfnd_testcase_budget_ms) {
+             break;
+         }
+-#ifdef HFND_RECVTIME
+-        if (ret == -1 && errno == EWOULDBLOCK) {
+-            time_t end = time(NULL);
+-            if ((end - start) > HFND_RECVTIME) {
+-                LOG_W("Honggfuzz Net Driver (pid=%d): Server didn't close the connection(fd=%d) "
+-                      "within %d seconds. Closing it.",
+-                    (int)getpid(), sock, HFND_RECVTIME);
+-                break;
++
++        int wait_ms = (int)(hfnd_testcase_budget_ms - elapsed_ms);
++        struct pollfd pfd = {.fd = sock, .events = POLLIN | POLLERR | POLLHUP, .revents = 0};
++        int pret          = TEMP_FAILURE_RETRY(poll(&pfd, 1, wait_ms));
++        if (pret == 0) {
++            break;
++        }
++        if (pret == -1) {
++            if (errno == EINTR) {
++                continue;
+             }
++            PLOG_D("Honggfuzz Net Driver (pid=%d): poll(sock=%d) failed", (int)getpid(), sock);
++            break;
++        }
++        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
++            break;
++        }
++        if (!(pfd.revents & POLLIN)) {
+             continue;
+         }
+-#endif
++
++        int ret = TEMP_FAILURE_RETRY(recv(sock, b, sizeof(b), MSG_DONTWAIT));
++        if (ret == 0) {
++            break;
++        }
+         if (ret == -1) {
+-            PLOG_W("Honggfuzz Net Driver (pid=%d): Connection to the server (sock=%d) closed with "
++            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
++                continue;
++            }
++            PLOG_D("Honggfuzz Net Driver (pid=%d): Connection to the server (sock=%d) closed with "
+                    "error",
+                 (int)getpid(), sock);
+             break;
+diff --git a/libhfnetdriver/netdriver.h b/libhfnetdriver/netdriver.h
+--- a/libhfnetdriver/netdriver.h
++++ b/libhfnetdriver/netdriver.h
+@@ -6,6 +6,7 @@
+ #include <stdint.h>
+ #include <sys/socket.h>
+ #include <sys/types.h>
++#include <sanitizer/common_interface_defs.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {

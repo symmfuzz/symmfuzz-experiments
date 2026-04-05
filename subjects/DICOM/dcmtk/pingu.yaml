@@ -1,0 +1,109 @@
+work-directory: "WORK-DIRECTORY"
+input-directory: "/home/user/pingu/no-inputs"
+timeout: TIMEOUT
+target-port: 5158
+jail-uid: UID
+jail-gid: GID
+seed: 0
+target: dcmtk
+svf-so-path: "/home/user/pingu/target/debug/libsvf_sys.so"
+
+monitor:
+  url: "http://127.0.0.1:8086"
+  org: "None"
+  bucket: "pingu"
+  token: ""
+  http-proxy: "http://127.0.0.1:8080"
+
+source:
+  bin-path: "/home/user/target/pingu/generator/dcmtk/build/bin/dcmqrti"
+  root-path: "/home/user/target/pingu/generator/dcmtk"
+  env:
+    - DCMDICTPATH: "/home/user/profuzzbench/subjects/DICOM/dcmtk/dicom.dic"
+  arguments:
+    - "--config"
+    - "/home/user/profuzzbench/subjects/DICOM/dcmtk/dcmqrti.cfg"
+    - "--aetitle"
+    - "YOU_AET"
+    - "--remote"
+    - "ANY-SCP"
+    - "localhost"
+  cwd: "/home/user/target/pingu/generator/dcmtk"
+  input-type: stdin
+  output-type: socket
+  log-stdout: true
+  log-stderr: true
+
+sink:
+  bin-path: "/home/user/target/pingu/consumer/dcmtk/build/bin/dcmqrscp"
+  root-path: "/home/user/target/pingu/consumer/dcmtk"
+  env:
+    - DCMDICTPATH: "/home/user/profuzzbench/subjects/DICOM/dcmtk/dicom.dic"
+  arguments:
+    [
+      "--single-process",
+      "--config",
+      "/home/user/profuzzbench/subjects/DICOM/dcmtk/dcmqrscp.cfg",
+      "-d"
+    ]
+  cwd: "/home/user/target/pingu/consumer/dcmtk"
+  input-type: socket
+  output-type: socket
+  is-server: true
+  server-port: "5158"
+  log-stdout: true
+  log-stderr: true
+  allow-unstable-sink: true
+  send-sigterm: true
+
+gcov:
+  bin-path: "/home/user/target/gcov/consumer/dcmtk/build/bin/dcmqrscp"
+  env:
+    - LD_PRELOAD: "libgcov_preload.so"
+  cwd: "/home/user/target/gcov/consumer/dcmtk"
+  src-dir: "/home/user/target/gcov/consumer/dcmtk"
+  reporter: gcovr
+
+stages:
+  deterministic:
+    enable: true
+  target-state:
+    beta-routing-threshold: 0.1
+    sink-cmplog:
+      enable: true
+    source-block:
+      enable: true
+
+svf:
+  llvm-path: "/usr"
+  svf-path: "/home/user/SVF"
+  z3-path: "/home/user/SVF/z3.obj"
+  build-mode: "Release"
+
+solver:
+  clangd-path: "/usr/bin/clangd"
+  extract-snippet-path: "/home/user/pingu/pingu-solver/tools/build/extract-snippet"
+  sut: "dcmtk"
+  protocol: "dicom"
+  max-rounds: 10
+  max-solution-candidates: 3
+  solver-cwd: "/home/user/pingu/pingu-solver"
+  py-path: "/home/user/pingu/.venv/bin/python3"
+  solver-py-path: "/home/user/pingu/pingu-solver/src/solver.py"
+  llm:
+    openai-model: "x-ai/grok-4.1-fast"
+    openai-api-base-url: "https://openrouter.ai/api/v1"
+    openai-use-responses-api: false
+    http-proxy: "http://172.17.0.1:9870"
+    seed: 123
+    env:
+      - LANGSMITH_TRACING: true
+      - LANGSMITH_ENDPOINT: https://api.smith.langchain.com
+      - LANGSMITH_PROJECT: pingu-solver
+
+scheduler:
+  katz-centrality:
+    alpha: 0.001
+    max-iter: 1000
+  proximity-weighted-alignment:
+    lambda: 0.1
